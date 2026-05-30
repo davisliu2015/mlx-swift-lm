@@ -1228,8 +1228,22 @@ public class ArraysCache: BaseKVCache {
 
 /// Simple cache for Mamba-style state space models
 public class MambaCache: ArraysCache {
+    /// Snapshot of state after processing confirmed tokens (for speculative decoding rollback).
+    /// Set by GatedDeltaNet when nConfirmed > 0. On draft rejection, restore this state.
+    public var rollbackState: [MLXArray]?
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
+    }
+
+    /// Rollback to the snapshot taken after confirmed tokens were processed.
+    /// Returns true if rollback was performed.
+    @discardableResult
+    public func rollback() -> Bool {
+        guard let saved = rollbackState else { return false }
+        self.state = saved
+        rollbackState = nil
+        return true
     }
 
     public override func copy() -> any KVCache {
@@ -1240,6 +1254,9 @@ public class MambaCache: ArraysCache {
         }
         new.offset = self.offset
         new.leftPadding = self.leftPadding
+        if let rb = rollbackState {
+            new.rollbackState = rb.map { $0[.ellipsis] }
+        }
         return new
     }
 }

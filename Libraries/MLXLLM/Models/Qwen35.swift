@@ -240,7 +240,8 @@ final class Qwen35GatedDeltaNet: Module {
     func callAsFunction(
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
-        cache: MambaCache? = nil
+        cache: MambaCache? = nil,
+        nConfirmed: Int = 0
     ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
@@ -261,6 +262,101 @@ final class Qwen35GatedDeltaNet: Module {
             qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
         }
 
+        // If nConfirmed is specified and less than S, process in two chunks:
+        // 1. Confirmed tokens (0..<nConfirmed) → save snapshot after processing
+        // 2. Draft tokens (nConfirmed..<S) → state may be rolled back on rejection
+        if nConfirmed > 0 && nConfirmed < S {
+            // --- Chunk 1: Confirmed tokens ---
+            let qkvC = qkv[0..., ..<nConfirmed, 0...]
+            let bC = b[0..., ..<nConfirmed, 0...]
+            let aC = a[0..., ..<nConfirmed, 0...]
+            let zC = z[0..., ..<nConfirmed, 0..., 0...]
+            let maskC = mask?[0..., ..<nConfirmed]
+
+            let convInputC = concatenated([convState, qkvC], axis: 1)
+            let convStateC = convInputC[0..., (-(convKernelSize - 1))...]
+
+            let convOutC = silu(conv1d(convInputC))
+            let convSplitC = MLX.split(convOutC, indices: [keyDim, 2 * keyDim], axis: -1)
+            let qC = convSplitC[0].reshaped(B, nConfirmed, numKHeads, headKDim)
+            let kC = convSplitC[1].reshaped(B, nConfirmed, numKHeads, headKDim)
+            let vC = convSplitC[2].reshaped(B, nConfirmed, numVHeads, headVDim)
+
+            let dtypeC = qC.dtype
+            let invScaleC = pow(Float(headKDim), -0.5)
+            let qNormedC =
+                MLXArray(pow(invScaleC, 2)).asType(dtypeC)
+                * MLXFast.rmsNorm(qC, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormedC =
+                MLXArray(invScaleC).asType(dtypeC)
+                * MLXFast.rmsNorm(kC, weight: MLXArray.mlxNone, eps: 1e-6)
+
+            var stateC = cache?[1]
+            var outC: MLXArray
+            (outC, stateC) = gatedDeltaUpdate(
+                q: qNormedC, k: kNormedC, v: vC,
+                a: aC, b: bC, aLog: aLog, dtBias: dtBias,
+                state: stateC, mask: maskC
+            )
+            outC = norm(outC, gate: zC)
+
+            // ★ Save rollback snapshot: state after confirmed tokens ★
+            if let cache {
+                var snapshotState = [MLXArray]()
+                snapshotState.append(convStateC[.ellipsis])  // deep copy
+                if let s = stateC {
+                    snapshotState.append(s[.ellipsis])
+                }
+                cache.rollbackState = snapshotState
+            }
+
+            // --- Chunk 2: Draft tokens ---
+            let nDraft = S - nConfirmed
+            let qkvD = qkv[0..., nConfirmed..., 0...]
+            let bD = b[0..., nConfirmed..., 0...]
+            let aD = a[0..., nConfirmed..., 0...]
+            let zD = z[0..., nConfirmed..., 0..., 0...]
+            let maskD = mask?[0..., nConfirmed...]
+
+            let convInputD = concatenated([convStateC, qkvD], axis: 1)
+            let convStateD = convInputD[0..., (-(convKernelSize - 1))...]
+
+            let convOutD = silu(conv1d(convInputD))
+            let convSplitD = MLX.split(convOutD, indices: [keyDim, 2 * keyDim], axis: -1)
+            let qD = convSplitD[0].reshaped(B, nDraft, numKHeads, headKDim)
+            let kD = convSplitD[1].reshaped(B, nDraft, numKHeads, headKDim)
+            let vD = convSplitD[2].reshaped(B, nDraft, numVHeads, headVDim)
+
+            let dtypeD = qD.dtype
+            let qNormedD =
+                MLXArray(pow(invScaleC, 2)).asType(dtypeD)
+                * MLXFast.rmsNorm(qD, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormedD =
+                MLXArray(invScaleC).asType(dtypeD)
+                * MLXFast.rmsNorm(kD, weight: MLXArray.mlxNone, eps: 1e-6)
+
+            var stateD = stateC
+            var outD: MLXArray
+            (outD, stateD) = gatedDeltaUpdate(
+                q: qNormedD, k: kNormedD, v: vD,
+                a: aD, b: bD, aLog: aLog, dtBias: dtBias,
+                state: stateD, mask: maskD
+            )
+            outD = norm(outD, gate: zD)
+
+            // Update cache to final state (includes draft tokens)
+            if let cache {
+                cache[0] = convStateD
+                cache[1] = stateD
+            }
+
+            // Concatenate outputs
+            let outFull = concatenated(
+                [outC.reshaped(B, nConfirmed, -1), outD.reshaped(B, nDraft, -1)], axis: 1)
+            return outProj(outFull)
+        }
+
+        // Normal path (no split needed)
         let convInput = concatenated([convState, qkv], axis: 1)
         if let cache {
             cache[0] = convInput[0..., (-(convKernelSize - 1))...]
@@ -491,11 +587,12 @@ final class Qwen35DecoderLayer: Module {
         _ x: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
-        cache: KVCache?
+        cache: KVCache?,
+        nConfirmed: Int = 0
     ) -> MLXArray {
         let r: MLXArray
         if isLinear {
-            r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+            r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache, nConfirmed: nConfirmed)
         } else {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
@@ -536,7 +633,7 @@ public class Qwen35TextModelInner: Module {
         super.init()
     }
 
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil, nConfirmed: Int = 0) -> MLXArray {
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
@@ -553,7 +650,8 @@ public class Qwen35TextModelInner: Module {
                 layer.isLinear
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
+                nConfirmed: layer.isLinear ? nConfirmed : 0)
         }
 
         return norm(hiddenStates)
@@ -602,8 +700,11 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     /// Forward pass that also returns hidden states (for MTP drafter)
-    public func forwardWithHiddenStates(_ inputs: MLXArray, cache: [KVCache]?) -> (logits: MLXArray, hiddenStates: MLXArray) {
-        let hiddenStates = model(inputs, cache: cache)
+    /// - Parameter nConfirmed: Number of confirmed tokens at the start of the input sequence.
+    ///   When > 0 and < input length, linear attention layers will snapshot their state after
+    ///   processing the confirmed tokens for zero-cost rollback on draft rejection.
+    public func forwardWithHiddenStates(_ inputs: MLXArray, cache: [KVCache]?, nConfirmed: Int = 0) -> (logits: MLXArray, hiddenStates: MLXArray) {
+        let hiddenStates = model(inputs, cache: cache, nConfirmed: nConfirmed)
         let logits: MLXArray
         if let lmHead {
             logits = lmHead(hiddenStates)
