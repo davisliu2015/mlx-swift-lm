@@ -49,6 +49,10 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     var moeIntermediateSize: Int = 0
     var normTopkProb: Bool = true
 
+    // MTP fields
+    var mtpNumHiddenLayers: Int = 0
+    var mtpUseDedicatedEmbeddings: Bool = false
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case hiddenSize = "hidden_size"
@@ -77,6 +81,8 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         case sharedExpertIntermediateSize = "shared_expert_intermediate_size"
         case moeIntermediateSize = "moe_intermediate_size"
         case normTopkProb = "norm_topk_prob"
+        case mtpNumHiddenLayers = "mtp_num_hidden_layers"
+        case mtpUseDedicatedEmbeddings = "mtp_use_dedicated_embeddings"
     }
 
     public init(from decoder: Decoder) throws {
@@ -129,6 +135,12 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         self.moeIntermediateSize =
             try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 0
         self.normTopkProb = try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? true
+
+        // MTP fields
+        self.mtpNumHiddenLayers =
+            try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
+        self.mtpUseDedicatedEmbeddings =
+            try container.decodeIfPresent(Bool.self, forKey: .mtpUseDedicatedEmbeddings) ?? false
 
         let ropeContainer = try decoder.container(keyedBy: RopeParametersCodingKey.self)
         let ropeParameters = try ropeContainer.decodeIfPresent(
@@ -557,6 +569,12 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
+    // MTP support
+    @ModuleInfo(key: "mtp") var mtp: Qwen35MTPModule?
+
+    /// Whether this model has MTP weights loaded
+    public var hasMTP: Bool { mtp != nil }
+
     public init(_ args: Qwen35TextConfiguration) {
         self.configuration = args
         self.vocabularySize = args.vocabularySize
@@ -565,6 +583,11 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
+        }
+
+        // Initialize MTP if configured
+        if args.mtpNumHiddenLayers > 0 {
+            _mtp.wrappedValue = Qwen35MTPModule(args)
         }
     }
 
@@ -578,6 +601,50 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return out
     }
 
+    /// Forward pass that also returns hidden states (for MTP drafter)
+    public func forwardWithHiddenStates(_ inputs: MLXArray, cache: [KVCache]?) -> (logits: MLXArray, hiddenStates: MLXArray) {
+        let hiddenStates = model(inputs, cache: cache)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(hiddenStates)
+        } else {
+            logits = model.embedTokens.asLinear(hiddenStates)
+        }
+        return (logits, hiddenStates)
+    }
+
+    /// Get MTP draft logits given hidden states and token IDs
+    public func mtpForward(_ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?) -> MLXArray? {
+        guard let mtp else { return nil }
+
+        let tokenEmb = model.embedTokens(tokenIds)
+        let eNormed = mtp.eNorm(tokenEmb)
+
+        // Align hidden states length to token embedding length (take last N positions)
+        let tokenLen = tokenEmb.dim(1)
+        let hiddenLen = hiddenStates.dim(1)
+        let alignedHidden: MLXArray
+        if hiddenLen > tokenLen {
+            alignedHidden = hiddenStates[0..., (hiddenLen - tokenLen)..., 0...]
+        } else {
+            alignedHidden = hiddenStates
+        }
+
+        let hNormed = mtp.hNorm(alignedHidden)
+        let combined = MLX.concatenated([eNormed, hNormed], axis: -1)
+        var x = mtp.fc(combined)
+
+        let mask = createAttentionMask(h: x, cache: cache?.first)
+        x = mtp.layers[0](x, mask: mask, cache: cache?.first)
+        x = mtp.norm(x)
+
+        if let lmHead {
+            return lmHead(x)
+        } else {
+            return model.embedTokens.asLinear(x)
+        }
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.map { layer in
             if layer.isLinear {
@@ -587,14 +654,26 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
-        let hasUnsanitizedConv1d = weights.contains { key, value in
+    public func sanitize(weights inputWeights: [String: MLXArray]) -> [String: MLXArray] {
+        let hasMTPWeights = inputWeights.keys.contains { $0.contains("mtp.") }
+        let hasUnsanitizedConv1d = inputWeights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        let shouldShiftNormWeights = hasMTPWeights || hasUnsanitizedConv1d
+        // Only shift norm weights if conv1d hasn't been sanitized yet (raw HF checkpoint).
+        // The presence of MTP weights alone does NOT indicate an unsanitized checkpoint —
+        // MLX-converted models can retain MTP weights while already having norms shifted.
+        let shouldShiftNormWeights = hasUnsanitizedConv1d
 
-        var weights = weights.filter { !$0.key.contains("mtp.") }
+        // Keep MTP weights if configured, otherwise filter them out
+        var weights: [String: MLXArray]
+        if configuration.mtpNumHiddenLayers > 0 && hasMTPWeights {
+            // Keep all weights as-is; model file keys already match module structure:
+            // mtp.pre_fc_norm_embedding.*, mtp.pre_fc_norm_hidden.*, mtp.fc.*,
+            // mtp.layers.0.*, mtp.norm.*
+            weights = inputWeights
+        } else {
+            weights = inputWeights.filter { !$0.key.contains("mtp.") }
+        }
 
         if configuration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
@@ -606,6 +685,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
         ]
 
         for k in Array(weights.keys) {
@@ -626,6 +708,32 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 }
 
+// MARK: - MTP Module Container
+
+/// Container for MTP-related sub-modules, loaded as part of the model weights
+/// Weight keys in model file:
+///   mtp.pre_fc_norm_embedding.weight  → eNorm
+///   mtp.pre_fc_norm_hidden.weight     → hNorm
+///   mtp.fc.*                          → fc (projection)
+///   mtp.layers.0.*                    → layers[0] (transformer block)
+///   mtp.norm.weight                   → norm (output norm)
+public class Qwen35MTPModule: Module {
+    @ModuleInfo(key: "pre_fc_norm_embedding") var eNorm: RMSNorm
+    @ModuleInfo(key: "pre_fc_norm_hidden") var hNorm: RMSNorm
+    @ModuleInfo(key: "fc") var fc: Linear
+    @ModuleInfo(key: "layers") var layers: [Qwen35MTPBlock]
+    @ModuleInfo(key: "norm") var norm: RMSNorm
+
+    init(_ args: Qwen35TextConfiguration) {
+        _eNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        _hNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        _fc.wrappedValue = Linear(args.hiddenSize * 2, args.hiddenSize, bias: false)
+        _layers.wrappedValue = [Qwen35MTPBlock(args)]
+        _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        super.init()
+    }
+}
+
 extension Qwen35TextModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
@@ -638,7 +746,7 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
-    @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
+    @ModuleInfo(key: "language_model") public var languageModel: Qwen35TextModel
 
     public init(_ args: Qwen35Configuration) {
         let textModel = Qwen35TextModel(args.textConfig)
