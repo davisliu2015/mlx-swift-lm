@@ -267,14 +267,51 @@ public protocol MTPCapableModel: LanguageModel {
         _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?
     ) -> MLXArray?
 
+    /// Optimized MTP forward with cache commit: commits the accepted draft position to the
+    /// MTP cache (KV update only, skipping norm + lm_head) then generates logits for the
+    /// current position in a single call.
+    ///
+    /// This avoids wasted lm_head computation on the commit position whose logits are discarded.
+    ///
+    /// - Parameters:
+    ///   - tokenIds: token IDs for current position, shape `(1, 1)`
+    ///   - hiddenStates: hidden states for current position, shape `(1, 1, H)`
+    ///   - commitToken: token ID for the accepted draft position to commit
+    ///   - commitHidden: hidden states for the commit position, shape `(1, 1, H)`
+    ///   - cache: MTP head KV cache
+    /// - Returns: logits tensor for current position, or `nil` if MTP is not available
+    func mtpForwardWithCommit(
+        _ tokenIds: MLXArray, hiddenStates: MLXArray,
+        commitToken: MLXArray, commitHidden: MLXArray,
+        cache: [KVCache]?
+    ) -> MLXArray?
+
     /// Create a new MTP cache (typically just `[KVCacheSimple()]` since MTP has 1 transformer layer).
     func newMTPCache() -> [KVCache]
 }
 
-/// Default implementation for `newMTPCache` — MTP heads typically have a single transformer layer.
+/// Default implementations for MTPCapableModel.
 extension MTPCapableModel {
     public func newMTPCache() -> [KVCache] {
         [KVCacheSimple()]
+    }
+
+    /// Default fallback: concatenate commit + current and call standard mtpForward.
+    /// Models can override this to provide an optimized implementation that skips
+    /// norm + lm_head computation on the commit position.
+    public func mtpForwardWithCommit(
+        _ tokenIds: MLXArray, hiddenStates: MLXArray,
+        commitToken: MLXArray, commitHidden: MLXArray,
+        cache: [KVCache]?
+    ) -> MLXArray? {
+        // Fallback: concatenate and call standard mtpForward, then take last position
+        let combinedHidden = MLX.concatenated([commitHidden, hiddenStates], axis: 1)
+        let combinedTokens = MLX.concatenated(
+            [commitToken.reshaped(1, 1), tokenIds.reshaped(1, 1)], axis: 1)
+        guard let logits = mtpForward(combinedTokens, hiddenStates: combinedHidden, cache: cache)
+        else { return nil }
+        // Return only the last position's logits
+        return logits[0..., -1, 0...][.newAxis, .newAxis]
     }
 }
 

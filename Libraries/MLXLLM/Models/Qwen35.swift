@@ -746,6 +746,51 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, MTPCap
         }
     }
 
+    /// Optimized MTP forward with cache commit.
+    ///
+    /// Instead of concatenating commit + current into seq_len=2 and running the full pipeline
+    /// (including wasted norm + lm_head on the commit position), this method:
+    /// 1. Processes commit position through MTP block (updates KV cache) — skips output norm + lm_head
+    /// 2. Processes current position through MTP block (with updated cache) — full pipeline including lm_head
+    ///
+    /// This saves one lm_head matrix multiply (hidden_size × vocab_size) per accepted draft token.
+    public func mtpForwardWithCommit(
+        _ tokenIds: MLXArray, hiddenStates: MLXArray,
+        commitToken: MLXArray, commitHidden: MLXArray,
+        cache: [KVCache]?
+    ) -> MLXArray? {
+        guard let mtp else { return nil }
+
+        // --- Step 1: Commit position (KV cache update only, skip norm + lm_head) ---
+        let commitEmb = model.embedTokens(commitToken.reshaped(1, 1))
+        let commitENormed = mtp.eNorm(commitEmb)
+        let commitHNormed = mtp.hNorm(commitHidden)
+        let commitCombined = MLX.concatenated([commitENormed, commitHNormed], axis: -1)
+        let commitX = mtp.fc(commitCombined)
+
+        // Run through attention to update KV cache (commit position)
+        let commitMask = createAttentionMask(h: commitX, cache: cache?.first)
+        // We only need the attention side-effect (KV cache update), output is discarded
+        let _ = mtp.layers[0](commitX, mask: commitMask, cache: cache?.first)
+
+        // --- Step 2: Current position (full pipeline with lm_head) ---
+        let tokenEmb = model.embedTokens(tokenIds.reshaped(1, 1))
+        let eNormed = mtp.eNorm(tokenEmb)
+        let hNormed = mtp.hNorm(hiddenStates)
+        let combined = MLX.concatenated([eNormed, hNormed], axis: -1)
+        var x = mtp.fc(combined)
+
+        let mask = createAttentionMask(h: x, cache: cache?.first)
+        x = mtp.layers[0](x, mask: mask, cache: cache?.first)
+        x = mtp.norm(x)
+
+        if let lmHead {
+            return lmHead(x)
+        } else {
+            return model.embedTokens.asLinear(x)
+        }
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.map { layer in
             if layer.isLinear {
@@ -877,6 +922,17 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider, MTPCapable
         _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?
     ) -> MLXArray? {
         languageModel.mtpForward(tokenIds, hiddenStates: hiddenStates, cache: cache)
+    }
+
+    public func mtpForwardWithCommit(
+        _ tokenIds: MLXArray, hiddenStates: MLXArray,
+        commitToken: MLXArray, commitHidden: MLXArray,
+        cache: [KVCache]?
+    ) -> MLXArray? {
+        languageModel.mtpForwardWithCommit(
+            tokenIds, hiddenStates: hiddenStates,
+            commitToken: commitToken, commitHidden: commitHidden,
+            cache: cache)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {

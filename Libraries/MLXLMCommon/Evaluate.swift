@@ -1178,29 +1178,29 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// - Parameter cacheCommit: When the previous draft was accepted, the accepted draft's
     ///   (hidden, token) is committed to the MTP cache for alignment before generating the new draft.
     ///   This corresponds to Python's `cache_commit=(hidden_at_confirmed, draft_tok)` mechanism.
+    ///
+    /// When `cacheCommit` is provided, uses `mtpForwardWithCommit` which skips norm + lm_head
+    /// computation on the commit position (saving one vocab-size matrix multiply per accept).
     private mutating func generateDraft(cacheCommit: (hidden: MLXArray, token: MLXArray)?) {
         guard let hidden = lastHiddenStates else { return }
 
-        let mtpHidden: MLXArray
-        let mtpTokenIds: MLXArray
+        let mtpLogits: MLXArray?
 
         if let commit = cacheCommit {
-            // cache_commit mode: first commit accepted draft position, then generate current draft
-            // hidden: [commit.hidden, current_hidden] → shape (1, 2, H)
-            // tokenIds: [commit.token, current_token] → shape (1, 2)
-            mtpHidden = MLX.concatenated([commit.hidden, hidden], axis: 1)
-            mtpTokenIds = MLX.concatenated(
-                [commit.token.reshaped(1, 1), y.tokens.reshaped(1, 1)], axis: 1)
+            // Optimized path: commit position only updates KV cache (skips norm + lm_head),
+            // then current position gets full computation including lm_head.
+            mtpLogits = model.mtpForwardWithCommit(
+                y.tokens, hiddenStates: hidden,
+                commitToken: commit.token, commitHidden: commit.hidden,
+                cache: mtpCache)
         } else {
-            // Normal mode: only current position
-            mtpHidden = hidden
-            mtpTokenIds = y.tokens[.newAxis]
+            // Normal path: only current position
+            mtpLogits = model.mtpForward(
+                y.tokens[.newAxis], hiddenStates: hidden, cache: mtpCache)
         }
 
-        if let mtpLogits = model.mtpForward(
-            mtpTokenIds, hiddenStates: mtpHidden, cache: mtpCache)
-        {
-            // Take logits at the last position (when cache_commit, pos 1; otherwise pos 0)
+        if let mtpLogits {
+            // Take logits at the last position
             var logits = mtpLogits[0..., -1, 0...]
             logits = processor?.process(logits: logits) ?? logits
             let draftToken = sampler.sample(logits: logits)
