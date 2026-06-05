@@ -205,6 +205,36 @@ public final class ModelContainer: Sendable {
         }
     }
 
+    /// Generate text using MTP (Multi-Token Prediction) speculative decoding.
+    ///
+    /// The model must conform to ``MTPCapableModel`` and have MTP weights loaded.
+    /// If the model doesn't support MTP, falls back to standard generation automatically.
+    ///
+    /// - Parameters:
+    ///   - input: Prepared language model input (transferred, not shared)
+    ///   - parameters: Generation parameters
+    ///   - useMTP: Pass `true` to enable MTP speculative decoding
+    ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination
+    /// - Returns: An AsyncStream of generation events
+    public func generate(
+        input: consuming sending LMInput,
+        parameters: GenerateParameters,
+        useMTP: Bool,
+        wiredMemoryTicket: WiredMemoryTicket? = nil
+    ) async throws -> AsyncStream<Generation> {
+        let input = SendableBox(input)
+
+        return try await context.read { context in
+            try MLXLMCommon.generate(
+                input: input.consume(),
+                parameters: parameters,
+                context: context,
+                useMTP: useMTP,
+                wiredMemoryTicket: wiredMemoryTicket
+            )
+        }
+    }
+
     /// Decode token IDs to a string.
     ///
     /// - Parameter tokenIds: Array of token IDs

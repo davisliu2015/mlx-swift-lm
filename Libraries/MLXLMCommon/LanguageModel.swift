@@ -228,6 +228,56 @@ extension LanguageModel {
     }
 }
 
+/// Protocol for language models that support Multi-Token Prediction (MTP) speculative decoding.
+///
+/// Models conforming to this protocol can use the built-in ``MTPSpeculativeTokenIterator``
+/// for speculative generation without requiring a separate draft model. The MTP head
+/// reuses the backbone's hidden states to predict the next draft token efficiently.
+///
+/// Currently supported by: Qwen3.5, Qwen3.6 (models with `mtpNumHiddenLayers > 0`).
+public protocol MTPCapableModel: LanguageModel {
+    /// Whether this model instance has MTP weights loaded and available.
+    var hasMTP: Bool { get }
+
+    /// Forward pass that returns both logits and hidden states.
+    ///
+    /// The hidden states are needed by the MTP head to produce draft tokens
+    /// without re-running the full backbone.
+    ///
+    /// - Parameters:
+    ///   - inputs: token IDs tensor of shape `(1, N)`
+    ///   - cache: backbone KV cache
+    ///   - nConfirmed: number of confirmed tokens at the start of the sequence.
+    ///     When > 0 and < input length, linear attention layers should snapshot their state
+    ///     after processing the confirmed tokens for zero-cost rollback on draft rejection.
+    /// - Returns: A tuple of `(logits, hiddenStates)` where hiddenStates has shape `(1, N, H)`
+    func forwardWithHiddenStates(
+        _ inputs: MLXArray, cache: [KVCache]?, nConfirmed: Int
+    ) -> (logits: MLXArray, hiddenStates: MLXArray)
+
+    /// MTP head forward pass: given backbone hidden states and token IDs,
+    /// produce logits for the next draft token.
+    ///
+    /// - Parameters:
+    ///   - tokenIds: token IDs tensor of shape `(1, N)` (the tokens whose embeddings are combined with hidden states)
+    ///   - hiddenStates: hidden states from the backbone of shape `(1, N, H)`
+    ///   - cache: MTP head KV cache (separate from backbone cache, typically 1 layer)
+    /// - Returns: logits tensor, or `nil` if MTP is not available
+    func mtpForward(
+        _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?
+    ) -> MLXArray?
+
+    /// Create a new MTP cache (typically just `[KVCacheSimple()]` since MTP has 1 transformer layer).
+    func newMTPCache() -> [KVCache]
+}
+
+/// Default implementation for `newMTPCache` — MTP heads typically have a single transformer layer.
+extension MTPCapableModel {
+    public func newMTPCache() -> [KVCache] {
+        [KVCacheSimple()]
+    }
+}
+
 /// Optional protocol that can be implemented by ``LanguageModel`` and will
 /// provide an automatic implementation of ``LanguageModel/newCache(parameters:)``
 public protocol KVCacheDimensionProvider {

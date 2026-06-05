@@ -962,6 +962,281 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     }
 }
 
+// MARK: - MTP Speculative Token Iterator
+
+/// Generator of tokens using Multi-Token Prediction (MTP) speculative decoding.
+///
+/// Unlike ``SpeculativeTokenIterator`` which requires a separate draft model,
+/// `MTPSpeculativeTokenIterator` uses the model's built-in MTP head as the drafter.
+/// The MTP head reuses hidden states from the backbone, making it much cheaper than
+/// running a separate draft model.
+///
+/// This is typically used via a call to
+/// ``generate(input:parameters:context:useMTP:wiredMemoryTicket:tools:)``
+/// returning `AsyncStream<Generation>`.
+///
+/// To use it directly:
+///
+/// ```swift
+/// let generateParameters: GenerateParameters
+/// let input: LMInput
+/// let model: MTPCapableModel
+///
+/// let iterator = try MTPSpeculativeTokenIterator(
+///     input: input, model: model, parameters: generateParameters)
+///
+/// for token in iterator {
+///     ...
+/// }
+/// ```
+///
+/// Port of the MTP speculative decoding logic from Python mlx-lm's `mtp_generate_step`.
+public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
+
+    let model: any MTPCapableModel
+    var cache: [KVCache]
+    var mtpCache: [KVCache]  // Reused across steps (not rebuilt each round)
+
+    var y: LMInput.Text
+    var processor: LogitProcessor?
+    let sampler: LogitSampler
+
+    public var tokenCount = 0
+    public let maxTokens: Int?
+
+    private var pendingTokens = [Int]()
+    private var pendingIndex = 0
+    private var pendingDraft: MLXArray?
+
+    public var promptPrefillTime: TimeInterval = 0.0
+
+    var lastHiddenStates: MLXArray?
+
+    // For cache_commit on accept: carry the accepted draft's hidden + token to align MTP cache
+    private var pendingCacheCommit: (hidden: MLXArray, token: MLXArray)?
+
+    /// Initialize a `MTPSpeculativeTokenIterator` with the given input.
+    ///
+    /// - Parameters:
+    ///   - input: language model input
+    ///   - model: a model conforming to ``MTPCapableModel``
+    ///   - cache: optional ``KVCache`` for the backbone model
+    ///   - parameters: the generation parameters
+    public init(
+        input: LMInput,
+        model: any MTPCapableModel,
+        cache: [KVCache]? = nil,
+        parameters: GenerateParameters
+    ) throws {
+        self.model = model
+        self.y = input.text
+        self.cache = cache ?? model.newCache(parameters: parameters)
+        self.mtpCache = model.newMTPCache()
+        self.sampler = parameters.sampler()
+        self.processor = parameters.processor()
+        self.maxTokens = parameters.maxTokens
+
+        self.promptPrefillTime = try measure {
+            try prepare(input: input, windowSize: parameters.prefillStepSize)
+        }
+    }
+
+    mutating func prepare(input: LMInput, windowSize: Int?) throws {
+        processor?.prompt(input.text.tokens)
+
+        switch try model.prepare(input, cache: cache, windowSize: windowSize) {
+        case .tokens(let tokens):
+            y = tokens
+            let (logits, hidden) = model.forwardWithHiddenStates(
+                y[text: .newAxis].tokens, cache: cache, nConfirmed: 0)
+            lastHiddenStates = hidden
+
+            var finalLogits = logits[0..., -1, 0...]
+            finalLogits = processor?.process(logits: finalLogits) ?? finalLogits
+            let token = sampler.sample(logits: finalLogits)
+            processor?.didSample(token: token)
+            y = .init(tokens: token)
+            eval(y.tokens)
+
+            // Align MTP cache: feed backbone hidden + first sampled token to MTP head
+            let _ = model.mtpForward(
+                y.tokens[.newAxis], hiddenStates: hidden, cache: mtpCache)
+
+        case .logits(let result):
+            var logits = result.logits[0..., -1, 0...]
+            logits = processor?.process(logits: logits) ?? logits
+            let token = sampler.sample(logits: logits)
+            processor?.didSample(token: token)
+            y = .init(tokens: token)
+            eval(y.tokens)
+        }
+
+        generateDraft(cacheCommit: nil)
+    }
+
+    mutating func speculateRound() {
+        let remaining = maxTokens.map { $0 - tokenCount } ?? 2
+        guard remaining > 0 else { return }
+
+        if let draftToken = pendingDraft {
+            pendingDraft = nil
+
+            // Verify: send [confirmed_token, draft_token] together into backbone
+            let verifyInput = MLX.concatenated([y.tokens, draftToken])[.newAxis]
+            let (verifyLogits, verifyHidden) = model.forwardWithHiddenStates(
+                verifyInput, cache: cache, nConfirmed: 1)
+
+            // Sample from position 0 (confirmed position) logits
+            var logits0 = verifyLogits[0..., 0, 0...]
+            logits0 = processor?.process(logits: logits0) ?? logits0
+            let verifyToken = sampler.sample(logits: logits0)
+            eval(verifyToken, draftToken)
+
+            let verifyId = verifyToken.item(Int.self)
+            let draftId = draftToken.item(Int.self)
+
+            if verifyId == draftId {
+                // ★ ACCEPT: draft hit
+                processor?.didSample(token: draftToken)
+                pendingTokens.append(draftId)
+
+                // Hidden at confirmed position (for cache_commit)
+                let hiddenAtConfirmed = verifyHidden[0..., 0...0, 0...]
+
+                if remaining > 1 {
+                    // Sample bonus token from position 1 (draft position) logits
+                    var logits1 = verifyLogits[0..., 1, 0...]
+                    logits1 = processor?.process(logits: logits1) ?? logits1
+                    let bonusToken = sampler.sample(logits: logits1)
+                    processor?.didSample(token: bonusToken)
+                    eval(bonusToken)
+                    pendingTokens.append(bonusToken.item(Int.self))
+                    lastHiddenStates = verifyHidden[0..., 1...1, 0...]
+                    y = .init(tokens: bonusToken)
+
+                    // cache_commit: next MTP forward needs to first commit the accepted draft position
+                    let commit = (hidden: hiddenAtConfirmed, token: draftToken)
+                    generateDraft(cacheCommit: commit)
+                } else {
+                    lastHiddenStates = verifyHidden[0..., 0...0, 0...]
+                    y = .init(tokens: draftToken)
+                    generateDraft(cacheCommit: nil)
+                }
+
+                // Clear rollback snapshots (confirmed)
+                for c in cache {
+                    if let mambaCache = c as? MambaCache {
+                        mambaCache.rollbackState = nil
+                    }
+                }
+                return
+            } else {
+                // ★ REJECT: draft miss, rollback
+                // KV cache rollback 1 position
+                for c in cache where c.isTrimmable {
+                    c.trim(1)
+                }
+                // MambaCache (SSM state) rollback
+                for c in cache {
+                    if let mambaCache = c as? MambaCache {
+                        mambaCache.rollback()
+                    }
+                }
+
+                // MTP cache also needs rollback
+                for c in mtpCache where c.isTrimmable {
+                    c.trim(1)
+                }
+
+                pendingTokens.append(verifyId)
+                processor?.didSample(token: verifyToken)
+                lastHiddenStates = verifyHidden[0..., 0...0, 0...]
+                y = .init(tokens: verifyToken)
+
+                // After reject, generate next draft without cache_commit
+                generateDraft(cacheCommit: nil)
+                return
+            }
+        }
+
+        // No draft available → normal forward
+        let (logits, hidden) = model.forwardWithHiddenStates(
+            y[text: .newAxis].tokens, cache: cache, nConfirmed: 0)
+        lastHiddenStates = hidden
+        var finalLogits = logits[0..., -1, 0...]
+        finalLogits = processor?.process(logits: finalLogits) ?? finalLogits
+        let token = sampler.sample(logits: finalLogits)
+        processor?.didSample(token: token)
+        eval(token)
+        pendingTokens.append(token.item(Int.self))
+        y = .init(tokens: token)
+        generateDraft(cacheCommit: nil)
+    }
+
+    /// Use MTP head to generate 1 draft token.
+    ///
+    /// - Parameter cacheCommit: When the previous draft was accepted, the accepted draft's
+    ///   (hidden, token) is committed to the MTP cache for alignment before generating the new draft.
+    ///   This corresponds to Python's `cache_commit=(hidden_at_confirmed, draft_tok)` mechanism.
+    private mutating func generateDraft(cacheCommit: (hidden: MLXArray, token: MLXArray)?) {
+        guard let hidden = lastHiddenStates else { return }
+
+        let mtpHidden: MLXArray
+        let mtpTokenIds: MLXArray
+
+        if let commit = cacheCommit {
+            // cache_commit mode: first commit accepted draft position, then generate current draft
+            // hidden: [commit.hidden, current_hidden] → shape (1, 2, H)
+            // tokenIds: [commit.token, current_token] → shape (1, 2)
+            mtpHidden = MLX.concatenated([commit.hidden, hidden], axis: 1)
+            mtpTokenIds = MLX.concatenated(
+                [commit.token.reshaped(1, 1), y.tokens.reshaped(1, 1)], axis: 1)
+        } else {
+            // Normal mode: only current position
+            mtpHidden = hidden
+            mtpTokenIds = y.tokens[.newAxis]
+        }
+
+        if let mtpLogits = model.mtpForward(
+            mtpTokenIds, hiddenStates: mtpHidden, cache: mtpCache)
+        {
+            // Take logits at the last position (when cache_commit, pos 1; otherwise pos 0)
+            var logits = mtpLogits[0..., -1, 0...]
+            logits = processor?.process(logits: logits) ?? logits
+            let draftToken = sampler.sample(logits: logits)
+            pendingDraft = draftToken
+            // Immediately eval draft token so its computation doesn't block the next backbone step
+            eval(draftToken)
+        }
+    }
+
+    mutating public func next() -> Int? {
+        if let maxTokens, tokenCount >= maxTokens {
+            return nil
+        }
+
+        if pendingIndex < pendingTokens.count {
+            let token = pendingTokens[pendingIndex]
+            pendingIndex += 1
+            tokenCount += 1
+            return token
+        }
+
+        pendingTokens.removeAll(keepingCapacity: true)
+        pendingIndex = 0
+        speculateRound()
+
+        if pendingTokens.isEmpty {
+            return nil
+        }
+
+        let token = pendingTokens[pendingIndex]
+        pendingIndex += 1
+        tokenCount += 1
+        return token
+    }
+}
+
 /// Result of a call to a deprecated callback-based generate function.
 public struct GenerateResult {
 
@@ -1439,6 +1714,86 @@ public func generate(
         draftCache: draftCache,
         parameters: parameters,
         numDraftTokens: numDraftTokens
+    )
+    let (stream, _) = generateLoopTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        handler: TextToolTokenLoopHandler(
+            tokenizer: context.tokenizer,
+            format: context.configuration.toolCallFormat ?? .json
+        )
+    )
+    return stream
+}
+
+/// Generates text asynchronously using MTP (Multi-Token Prediction) speculative decoding.
+///
+/// This function uses the model's built-in MTP head as the drafter, which is much more efficient
+/// than using a separate draft model because it reuses hidden states from the backbone's forward pass.
+///
+/// The model in `context` must conform to ``MTPCapableModel`` and have MTP weights loaded.
+/// If the model does not support MTP, this function falls back to standard generation.
+///
+/// ### Example Usage:
+/// ```swift
+/// let generateParameters: GenerateParameters
+/// let input: UserInput
+/// let context: ModelContext  // model must conform to MTPCapableModel
+///
+/// let lmInput = try context.processor.prepare(input: input)
+///
+/// let stream = try generate(
+///     input: lmInput, parameters: generateParameters,
+///     context: context, useMTP: true)
+///
+/// for await generation in stream {
+///     switch generation {
+///     case .chunk(let text):
+///         print("Generated text: \(text)")
+///     case .info(let info):
+///         print("Finished: \(info.tokensPerSecond) tokens/s.")
+///     case .toolCall(let call):
+///         print("Tool call: \(call.function.name)")
+///     }
+/// }
+/// ```
+///
+/// - Parameters:
+///   - input: The input for the language model.
+///   - cache: optional ``KVCache`` for the backbone model.
+///   - parameters: The configuration options for token generation.
+///   - context: The model context. The model must conform to ``MTPCapableModel``.
+///   - useMTP: Must be `true` to use MTP speculative decoding. If the model doesn't support MTP,
+///     falls back to standard generation.
+///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
+///   - tools: Optional tool schemas used to parse tool-call arguments into their declared types.
+/// - Returns: An `AsyncStream` that emits `Generation` values.
+/// - Throws: An error if the iterator initialization fails.
+public func generate(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    useMTP: Bool,
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [[String: any Sendable]]? = nil
+) throws -> AsyncStream<Generation> {
+    // Check if the model supports MTP
+    guard useMTP, let mtpModel = context.model as? (any MTPCapableModel), mtpModel.hasMTP else {
+        // Fall back to standard generation
+        return try generate(
+            input: input, cache: cache, parameters: parameters, context: context,
+            wiredMemoryTicket: wiredMemoryTicket, tools: tools)
+    }
+
+    let iterator = try MTPSpeculativeTokenIterator(
+        input: input,
+        model: mtpModel,
+        cache: cache,
+        parameters: parameters
     )
     let (stream, _) = generateLoopTask(
         promptTokenCount: input.text.tokens.size,

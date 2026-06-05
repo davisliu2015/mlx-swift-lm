@@ -658,7 +658,7 @@ public class Qwen35TextModelInner: Module {
     }
 }
 
-public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, MTPCapableModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -755,6 +755,11 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    public func newMTPCache() -> [KVCache] {
+        // MTP head has a single transformer layer
+        [KVCacheSimple()]
+    }
+
     public func sanitize(weights inputWeights: [String: MLXArray]) -> [String: MLXArray] {
         let hasMTPWeights = inputWeights.keys.contains { $0.contains("mtp.") }
         let hasUnsanitizedConv1d = inputWeights.contains { key, value in
@@ -843,7 +848,7 @@ extension Qwen35TextModel: LoRAModel {
 
 // MARK: - Top-level Model
 
-public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider, MTPCapableModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -856,12 +861,30 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         _languageModel.wrappedValue = textModel
     }
 
+    public var hasMTP: Bool { languageModel.hasMTP }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
     }
 
+    public func forwardWithHiddenStates(
+        _ inputs: MLXArray, cache: [KVCache]?, nConfirmed: Int = 0
+    ) -> (logits: MLXArray, hiddenStates: MLXArray) {
+        languageModel.forwardWithHiddenStates(inputs, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func mtpForward(
+        _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?
+    ) -> MLXArray? {
+        languageModel.mtpForward(tokenIds, hiddenStates: hiddenStates, cache: cache)
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         languageModel.newCache(parameters: parameters)
+    }
+
+    public func newMTPCache() -> [KVCache] {
+        languageModel.newMTPCache()
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
