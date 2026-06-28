@@ -792,13 +792,23 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, MTPCap
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        return model.layers.map { layer in
+        // 仅对 full-attention 层考虑环形 KV：
+        //   - parameters?.maxKVSize 非空：用 RotatingKVCache(maxSize:keep:)
+        //     第 maxKVSize+1 个 token 写入时会环形覆盖最旧位置（保留前 keep 个 attention sink），
+        //     offset 单调递增不回绕，保证 RoPE 位置编码正确。
+        //   - 为空：维持 KVCacheSimple()，无界增长（兼容旧调用方）。
+        // DeltaNet 层始终用 MambaCache（固定大小递归状态，与序列长度无关）。
+        let keep = 4   // attention sink，防止注意力失稳
+        return model.layers.map { layer -> KVCache in
             if layer.isLinear {
                 return MambaCache()
             }
+            if let maxKVSize = parameters?.maxKVSize, maxKVSize > 0 {
+                return RotatingKVCache(maxSize: maxKVSize, keep: keep)
+            }
             return KVCacheSimple()
         }
-    }
+    } 
 
     public func newMTPCache() -> [KVCache] {
         // MTP head has a single transformer layer
