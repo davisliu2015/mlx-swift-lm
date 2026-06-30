@@ -1098,6 +1098,261 @@ public class ChunkedKVCache: KVCacheSimple {
     }
 }
 
+/// Apply a *uniform* RoPE position shift of `delta` to every position in `x`.
+///
+/// RoPE bakes an absolute position into each key via a rotation `R(p·θ)`. To move a
+/// key from logical position `p` to `p + delta` we left-multiply by `R(delta·θ)`,
+/// the *same* rotation for every row (independent of the row's own index). Because
+/// rotations compose, `R(delta·θ) · R(p·θ) = R((p + delta)·θ)`, i.e. a uniform rotation
+/// of an already-baked key is exactly equivalent to re-baking it at the shifted position.
+///
+/// The angles are computed with MLX's default RoPE frequency convention,
+/// `θ_i = base^(-2i / dimensions)` (with the per-position `scale` factor), so the result
+/// is numerically consistent with how the keys were originally rotated. The rotation is
+/// performed with explicit `cos`/`sin` tensors rather than re-invoking `MLXFast.RoPE` on a
+/// collapsed length-1 sequence: the latter is mathematically equivalent but is mishandled
+/// by the Metal RoPE kernel for a `[N, 1, D]` layout, yielding incorrect results on GPU.
+///
+/// - Important: This is exact only for **standard / linear-scaled RoPE** (the default,
+///   used by e.g. Qwen3, Llama without dynamic scaling). It is **not** valid for YaRN /
+///   LongRoPE / Llama3 dynamic scaling, whose effective frequencies depend on the
+///   sequence-length regime and are therefore not invariant under a pure rotation.
+///
+/// - Parameters:
+///   - x: keys with shape `[B, kvHeads, L, headDim]` (already RoPE'd).
+///   - delta: position delta to add (negative to move tokens earlier).
+///   - dimensions: number of head dimensions RoPE rotates (often `headDim`).
+///   - traditional: whether RoPE uses the interleaved (GPT-J) layout.
+///   - base: RoPE theta base.
+///   - scale: RoPE position scale (1.0 for no scaling, `1/factor` for linear scaling).
+/// - Returns: `x` with every position shifted by `delta`.
+func applyUniformRoPEShift(
+    _ x: MLXArray,
+    delta: Int,
+    dimensions: Int,
+    traditional: Bool,
+    base: Float,
+    scale: Float
+) -> MLXArray {
+    if delta == 0 { return x }
+
+    let d = x.dim(x.ndim - 1)
+    let rotaryDims = min(dimensions, d)
+    precondition(rotaryDims % 2 == 0, "RoPE dimensions must be even")
+    let half = rotaryDims / 2
+
+    // Precompute the (uniform) rotation angles on the host: angle_i = delta · scale / θ_i,
+    // with θ_i = base^(2i / dimensions). This matches MLXFast.RoPE's default convention.
+    var cosValues = [Float](repeating: 0, count: half)
+    var sinValues = [Float](repeating: 0, count: half)
+    for i in 0 ..< half {
+        let invFreq = 1.0 / pow(Double(base), Double(2 * i) / Double(dimensions))
+        let angle = Double(delta) * Double(scale) * invFreq
+        cosValues[i] = Float(Foundation.cos(angle))
+        sinValues[i] = Float(Foundation.sin(angle))
+    }
+    let cosV = MLXArray(cosValues)  // shape [half], broadcasts over the head dim
+    let sinV = MLXArray(sinValues)
+
+    // Split off any non-rotary tail (partial rotary embeddings) to pass through untouched.
+    let xr = rotaryDims < d ? x[.ellipsis, ..<rotaryDims] : x
+    let xPass: MLXArray? = rotaryDims < d ? x[.ellipsis, rotaryDims...] : nil
+
+    let rotated: MLXArray
+    if traditional {
+        // Interleaved (GPT-J) layout: rotate pairs (2i, 2i+1).
+        var pairShape = xr.shape
+        pairShape[pairShape.count - 1] = half
+        pairShape.append(2)
+        let pairs = xr.reshaped(pairShape)
+        let x1 = pairs[.ellipsis, 0]
+        let x2 = pairs[.ellipsis, 1]
+        let o1 = x1 * cosV - x2 * sinV
+        let o2 = x2 * cosV + x1 * sinV
+        rotated = stacked([o1, o2], axis: -1).reshaped(xr.shape)
+    } else {
+        // NeoX (half-split) layout: rotate pairs (i, i + half).
+        let x1 = xr[.ellipsis, ..<half]
+        let x2 = xr[.ellipsis, half...]
+        let o1 = x1 * cosV - x2 * sinV
+        let o2 = x2 * cosV + x1 * sinV
+        rotated = concatenated([o1, o2], axis: -1)
+    }
+
+    if let xPass {
+        return concatenated([rotated, xPass], axis: -1)
+    }
+    return rotated
+}
+
+/// Streaming KV cache implementing the "attention sink + sliding window" strategy
+/// (StreamingLLM, Xiao et al. 2023) on top of MLX's *post-RoPE* cache.
+///
+/// ## Why this exists
+///
+/// `KVCacheSimple` grows without bound and its single `offset` couples three roles
+/// (valid length / physical slot / RoPE position), so it cannot drop early tokens.
+/// `RotatingKVCache` can drop middle tokens but keeps each survivor's *original*
+/// absolute RoPE position, so the query-to-token distance keeps growing and eventually
+/// exceeds the model's trained context (RoPE extrapolation → quality collapse).
+///
+/// `StreamingKVCache` fixes the position problem: when the cache exceeds capacity it
+/// evicts the oldest *non-sink* tokens and **re-indexes the survivors back to a bounded,
+/// contiguous position range** by applying a uniform RoPE rotation (see
+/// ``applyUniformRoPEShift(_:delta:dimensions:traditional:base:scale:)``). Logical
+/// positions therefore never exceed `keep + windowSize`, so the model stays in-distribution
+/// indefinitely, with **no full re-prefill** — only an O(N) rotation of the kept keys.
+///
+/// ## Layout
+///
+/// Tokens are stored contiguously as `[ sink (≤keep) | window (≤windowSize) ]`. The first
+/// `keep` tokens are *attention sinks* (typically the very first tokens / system prompt)
+/// and are **never moved or re-rotated**. Empirically, retaining a few sink tokens is
+/// required for quality — pure window eviction without sinks degrades sharply.
+///
+/// ## Usage discipline
+///
+/// `update(keys:values:)` only ever *appends* (identical to `KVCacheSimple`), keeping the
+/// hot decode path simple and correct. Eviction is an **explicit** operation the caller
+/// invokes at a safe boundary (e.g. between chat turns), mirroring
+/// ``ChunkedKVCache/maybeTrimFront()``:
+///
+/// ```swift
+/// // after a turn completes, before the next prefill:
+/// for c in cache { (c as? StreamingKVCache)?.evictToWindow() }
+/// ```
+///
+/// - Important: This cache is **lossy** — evicted tokens are gone and later attention can
+///   no longer see them. It also assumes **standard / linear-scaled RoPE**; do not use it
+///   with YaRN / LongRoPE models (see ``applyUniformRoPEShift(_:delta:dimensions:traditional:base:scale:)``).
+public class StreamingKVCache: KVCacheSimple {
+    /// Number of leading "attention sink" tokens that are always retained and never re-rotated.
+    public private(set) var keep: Int
+    /// Maximum number of non-sink (sliding window) tokens retained after eviction.
+    public private(set) var windowSize: Int
+
+    // RoPE parameters needed to re-index survivors. Must match the model's RoPE.
+    private var ropeDimensions: Int
+    private var ropeBase: Float
+    private var ropeTraditional: Bool
+    private var ropeScale: Float
+
+    /// The maximum number of valid tokens kept after an eviction (`keep + windowSize`).
+    public var capacity: Int { keep + windowSize }
+
+    /// - Parameters:
+    ///   - keep: number of leading sink tokens to always retain (StreamingLLM suggests ~4).
+    ///   - windowSize: number of most-recent tokens to retain after eviction.
+    ///   - ropeDimensions: RoPE rotary dimensions (usually the model's `headDim`).
+    ///   - ropeBase: RoPE theta base (the model's `ropeTheta` / `rope_theta`).
+    ///   - ropeTraditional: whether RoPE uses the interleaved layout (default `false`).
+    ///   - ropeScale: RoPE position scale (`1.0` for none, `1/factor` for linear scaling).
+    public init(
+        keep: Int = 4,
+        windowSize: Int,
+        ropeDimensions: Int,
+        ropeBase: Float,
+        ropeTraditional: Bool = false,
+        ropeScale: Float = 1.0
+    ) {
+        precondition(keep >= 0, "keep must be >= 0")
+        precondition(windowSize > 0, "windowSize must be > 0")
+        self.keep = keep
+        self.windowSize = windowSize
+        self.ropeDimensions = ropeDimensions
+        self.ropeBase = ropeBase
+        self.ropeTraditional = ropeTraditional
+        self.ropeScale = ropeScale
+        super.init()
+    }
+
+    /// Whether the cache currently holds more valid tokens than `capacity`.
+    public var needsEviction: Bool { offset > capacity }
+
+    /// Evict the oldest non-sink tokens so that the cache holds at most `capacity`
+    /// valid tokens, re-indexing the surviving window tokens to a contiguous,
+    /// bounded RoPE position range. No-op if already within capacity.
+    ///
+    /// This is the core of the streaming strategy and the intended replacement for a
+    /// full re-prefill. It must be called explicitly (see the type's discussion).
+    public func evictToWindow() {
+        guard let keys = self.keys, let values = self.values else { return }
+        let valid = offset
+        guard valid > capacity else { return }
+
+        // Number of (post-sink) tokens to drop from the front of the window region.
+        let evict = valid - capacity
+
+        // Materialize the currently-valid region.
+        let validKeys = keys[.ellipsis, ..<valid, 0...]
+        let validValues = values[.ellipsis, ..<valid, 0...]
+
+        // [0, keep): sinks — kept verbatim (positions and rotation unchanged).
+        let sinkKeys = validKeys[.ellipsis, ..<keep, 0...]
+        let sinkValues = validValues[.ellipsis, ..<keep, 0...]
+
+        // [keep + evict, valid): surviving window tokens, currently at positions
+        // [keep+evict, valid). Re-index them down by `evict` to occupy [keep, valid-evict).
+        let winKeys = validKeys[.ellipsis, (keep + evict)..., 0...]
+        let winValues = validValues[.ellipsis, (keep + evict)..., 0...]
+
+        // Keys carry RoPE position → shift. Values are position-free → untouched.
+        let shiftedWinKeys = applyUniformRoPEShift(
+            winKeys,
+            delta: -evict,
+            dimensions: ropeDimensions,
+            traditional: ropeTraditional,
+            base: ropeBase,
+            scale: ropeScale
+        )
+
+        self.keys = concatenated([sinkKeys, shiftedWinKeys], axis: 2)
+        self.values = concatenated([sinkValues, winValues], axis: 2)
+        self.offset = capacity
+    }
+
+    public override func copy() -> any KVCache {
+        let new = StreamingKVCache(
+            keep: keep,
+            windowSize: windowSize,
+            ropeDimensions: ropeDimensions,
+            ropeBase: ropeBase,
+            ropeTraditional: ropeTraditional,
+            ropeScale: ropeScale
+        )
+        new.step = self.step
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        return new
+    }
+
+    public override var metaState: [String] {
+        get {
+            [
+                String(keep),
+                String(windowSize),
+                String(ropeDimensions),
+                String(ropeBase),
+                ropeTraditional ? "1" : "0",
+                String(ropeScale),
+            ]
+        }
+        set {
+            guard newValue.count == 6 else {
+                fatalError("StreamingKVCache metaState must have exactly 6 values")
+            }
+            self.keep = Int(newValue[0]) ?? 4
+            self.windowSize = Int(newValue[1]) ?? 1
+            self.ropeDimensions = Int(newValue[2]) ?? 0
+            self.ropeBase = Float(newValue[3]) ?? 10000
+            self.ropeTraditional = newValue[4] == "1"
+            self.ropeScale = Float(newValue[5]) ?? 1.0
+        }
+    }
+}
+
 /// Base cache for array-based state storage
 public class ArraysCache: BaseKVCache {
     private var cache: [MLXArray?]
@@ -1397,6 +1652,7 @@ struct KVCacheError: Error {
 /// Map a cache instance to its Python-compatible class name for serialization.
 private func cacheClassName(_ cache: KVCache) -> String {
     switch cache {
+    case is StreamingKVCache: return "StreamingKVCache"
     case is ChunkedKVCache: return "ChunkedKVCache"
     case is MambaCache: return "MambaCache"
     case is ArraysCache: return "ArraysCache"
@@ -1543,6 +1799,17 @@ private func restoreCacheFromMetaState(
         let cache = ChunkedKVCache()
         cache.state = state
         cache.metaState = metaState
+        return cache
+
+    case "StreamingKVCache":
+        guard metaState.count == 6 else {
+            throw KVCacheError(
+                message: "Invalid StreamingKVCache metaState - expected 6 values")
+        }
+        let cache = StreamingKVCache(
+            windowSize: 1, ropeDimensions: 0, ropeBase: 10000)
+        cache.metaState = metaState
+        cache.state = state
         return cache
 
     case "MambaCache":
