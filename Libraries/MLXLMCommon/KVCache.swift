@@ -1269,19 +1269,30 @@ public class StreamingKVCache: KVCacheSimple {
     /// Whether the cache currently holds more valid tokens than `capacity`.
     public var needsEviction: Bool { offset > capacity }
 
-    /// Evict the oldest non-sink tokens so that the cache holds at most `capacity`
-    /// valid tokens, re-indexing the surviving window tokens to a contiguous,
-    /// bounded RoPE position range. No-op if already within capacity.
-    ///
-    /// This is the core of the streaming strategy and the intended replacement for a
-    /// full re-prefill. It must be called explicitly (see the type's discussion).
-    public func evictToWindow() {
-        guard let keys = self.keys, let values = self.values else { return }
-        let valid = offset
-        guard valid > capacity else { return }
+    /// How many non-sink tokens are available for eviction (i.e. everything between sink
+    /// and the newest token). Returns 0 when the cache is empty or only contains sinks.
+    public var evictableCount: Int { max(0, offset - keep) }
 
-        // Number of (post-sink) tokens to drop from the front of the window region.
-        let evict = valid - capacity
+    /// Evict **exactly** `tokenCount` of the oldest non-sink tokens and re-index the
+    /// surviving window tokens to a contiguous, bounded RoPE position range.
+    ///
+    /// This is the preferred entry-point when the caller knows how many tokens to drop
+    /// (e.g. after aligning to a message boundary). It returns the actual number of tokens
+    /// evicted (may be less than requested if the cache doesn't hold that many non-sink
+    /// tokens).
+    ///
+    /// - Parameter tokenCount: number of oldest non-sink tokens to evict. Must be > 0.
+    /// - Returns: the number of tokens actually evicted.
+    @discardableResult
+    public func evict(tokenCount: Int) -> Int {
+        guard tokenCount > 0,
+              let keys = self.keys, let values = self.values else { return 0 }
+        let valid = offset
+        guard valid > keep else { return 0 }
+
+        // Clamp to the number of non-sink tokens actually present.
+        let evict = min(tokenCount, valid - keep)
+        guard evict > 0 else { return 0 }
 
         // Materialize the currently-valid region.
         let validKeys = keys[.ellipsis, ..<valid, 0...]
@@ -1308,7 +1319,20 @@ public class StreamingKVCache: KVCacheSimple {
 
         self.keys = concatenated([sinkKeys, shiftedWinKeys], axis: 2)
         self.values = concatenated([sinkValues, winValues], axis: 2)
-        self.offset = capacity
+        self.offset = valid - evict
+        return evict
+    }
+
+    /// Evict the oldest non-sink tokens so that the cache holds at most `capacity`
+    /// valid tokens. Convenience wrapper around ``evict(tokenCount:)`` that drops
+    /// exactly enough to reach capacity. No-op if already within capacity.
+    ///
+    /// This is the core of the streaming strategy and the intended replacement for a
+    /// full re-prefill. It must be called explicitly (see the type's discussion).
+    public func evictToWindow() {
+        let valid = offset
+        guard valid > capacity else { return }
+        evict(tokenCount: valid - capacity)
     }
 
     public override func copy() -> any KVCache {

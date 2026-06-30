@@ -226,6 +226,98 @@ struct StreamingKVCacheTests {
         #expect(restored.offset == restored.capacity)
     }
 
+    // MARK: - Partial eviction via evict(tokenCount:)
+
+    /// evict(tokenCount:) should drop exactly the requested number of tokens and leave
+    /// the rest intact. The returned count must equal the requested amount.
+    @Test func evictExactTokenCount() {
+        MLXRandom.seed(10)
+        let keep = 4, windowSize = 20
+        let N = 30  // 30 tokens in cache, capacity = 24, so 6 over
+        let raw = MLXRandom.normal([1, 2, N, dims]).asType(.float32)
+        let values = MLXRandom.normal([1, 2, N, dims]).asType(.float32)
+        let bakedKeys = rope(raw, offset: 0)
+        eval(raw, values, bakedKeys)
+
+        let cache = StreamingKVCache(
+            keep: keep, windowSize: windowSize,
+            ropeDimensions: dims, ropeBase: base, ropeTraditional: traditional, ropeScale: scale)
+        _ = cache.update(keys: bakedKeys, values: values)
+        #expect(cache.offset == N)
+        #expect(cache.evictableCount == N - keep)  // 26
+
+        // Evict only 10 tokens (not all the way to capacity).
+        let evicted = cache.evict(tokenCount: 10)
+        #expect(evicted == 10)
+        #expect(cache.offset == N - 10)  // 20
+
+        // Verify sinks untouched.
+        let sinkAfter = cache.state[0][.ellipsis, ..<keep, 0...]
+        let sinkExpected = bakedKeys[.ellipsis, ..<keep, 0...]
+        eval(sinkAfter, sinkExpected)
+        #expect(allClose(sinkAfter, sinkExpected, atol: 1e-5).item(Bool.self))
+
+        // Verify surviving window keys match re-baked ground truth.
+        let winRaw = raw[.ellipsis, (keep + 10)..., 0...]
+        let expectedWinKeys = rope(winRaw, offset: keep)
+        let gotWinKeys = cache.state[0][.ellipsis, keep..., 0...]
+        eval(expectedWinKeys, gotWinKeys)
+        #expect(
+            allClose(gotWinKeys, expectedWinKeys, atol: 1e-4).item(Bool.self),
+            "partial evict keys mismatch")
+    }
+
+    /// evict(tokenCount:) with a count larger than evictable should clamp and not crash.
+    @Test func evictClampsToAvailable() {
+        MLXRandom.seed(11)
+        let keep = 4, windowSize = 16
+        let N = 12  // less than capacity (20), only 8 non-sink tokens
+        let cache = StreamingKVCache(
+            keep: keep, windowSize: windowSize,
+            ropeDimensions: dims, ropeBase: base)
+        let keys = rope(MLXRandom.normal([1, 2, N, dims]).asType(.float32), offset: 0)
+        let values = MLXRandom.normal([1, 2, N, dims]).asType(.float32)
+        _ = cache.update(keys: keys, values: values)
+
+        #expect(cache.evictableCount == N - keep)  // 8
+
+        // Request evicting 100 tokens — should clamp to 8.
+        let evicted = cache.evict(tokenCount: 100)
+        #expect(evicted == N - keep)  // 8
+        #expect(cache.offset == keep) // only sinks remain
+    }
+
+    /// evictToWindow should produce exactly the same result as evict(tokenCount: overflow).
+    @Test func evictToWindowMatchesExplicitEvict() {
+        MLXRandom.seed(12)
+        let keep = 4, windowSize = 16
+        let capacity = keep + windowSize
+        let N = 30
+        let raw = MLXRandom.normal([1, 2, N, dims]).asType(.float32)
+        let values = MLXRandom.normal([1, 2, N, dims]).asType(.float32)
+        let bakedKeys = rope(raw, offset: 0)
+        eval(raw, values, bakedKeys)
+
+        // Path A: evictToWindow()
+        let cacheA = StreamingKVCache(
+            keep: keep, windowSize: windowSize,
+            ropeDimensions: dims, ropeBase: base, ropeTraditional: traditional, ropeScale: scale)
+        _ = cacheA.update(keys: bakedKeys, values: values)
+        cacheA.evictToWindow()
+
+        // Path B: evict(tokenCount: N - capacity)
+        let cacheB = StreamingKVCache(
+            keep: keep, windowSize: windowSize,
+            ropeDimensions: dims, ropeBase: base, ropeTraditional: traditional, ropeScale: scale)
+        _ = cacheB.update(keys: bakedKeys, values: values)
+        cacheB.evict(tokenCount: N - capacity)
+
+        #expect(cacheA.offset == cacheB.offset)
+        eval(cacheA.state[0], cacheA.state[1], cacheB.state[0], cacheB.state[1])
+        #expect(allClose(cacheA.state[0], cacheB.state[0], atol: 1e-6).item(Bool.self))
+        #expect(allClose(cacheA.state[1], cacheB.state[1], atol: 1e-6).item(Bool.self))
+    }
+
     @Test func copyIsIndependent() {
         MLXRandom.seed(7)
         let cache = StreamingKVCache(

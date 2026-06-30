@@ -5,7 +5,7 @@
 撞上 context size 上限、也不会因为 RoPE 外推导致质量崩塌。
 
 > 代码位置：`Libraries/MLXLMCommon/KVCache.swift`
-> 单测：`Tests/MLXLMTests/StreamingKVCacheTests.swift`（8 个用例，纯数值自验证，无需下载模型）
+> 单测：`Tests/MLXLMTests/StreamingKVCacheTests.swift`（11 个用例，纯数值自验证，无需下载模型）
 
 ---
 
@@ -134,32 +134,99 @@ let stream = try generate(
 ### 4.3 在「安全边界」显式淘汰
 
 **`update(keys:values:)` 只负责追加**（和 `KVCacheSimple` 完全一致），保证解码热路径简单正确。
-淘汰是一个**显式动作**，由你在安全点调用——典型时机是**每轮对话结束、下一次 prefill 之前**：
+淘汰是一个**显式动作**，由你在安全点调用——典型时机是**每轮对话结束、下一次 prefill 之前**。
+
+框架提供两种淘汰方式：
+
+#### A. `evict(tokenCount:)` — 精确控制丢弃数量（推荐）
+
+上层计算好要丢多少个 token（对齐到消息边界后），直接告诉 cache：
 
 ```swift
-// 一轮生成结束后、准备处理下一条用户消息之前：
+// 返回实际淘汰的 token 数（可能被 clamp 到 evictableCount）
+let evicted = (c as? StreamingKVCache)?.evict(tokenCount: tokensToEvict) ?? 0
+```
+
+- `evictableCount` 属性：当前可淘汰的非 sink token 总数（`offset - keep`）。
+- 如果请求数超过 `evictableCount`，自动 clamp，不会 crash。
+- 淘汰后 `offset` 减少 `evicted`（不一定等于 `capacity`）。
+
+#### B. `evictToWindow()` — 一步砍到 capacity（懒人版）
+
+不关心消息边界，直接砍到 `capacity = keep + windowSize`：
+
+```swift
 for c in cache {
     (c as? StreamingKVCache)?.evictToWindow()
 }
 ```
 
-`evictToWindow()` 的语义：
+等价于 `evict(tokenCount: offset - capacity)`。
 
-- 若当前有效 token 数 `≤ capacity`：**空操作**；
-- 否则：丢弃 `[keep, keep+evict)` 这段最旧的非 sink token，把 `[keep+evict, valid)` 的幸存
-  窗口 token **整体下移** `evict` 个位置（key 做均匀 RoPE 旋转，value 不含位置信息、原样保留），
-  sink token `[0, keep)` **原封不动**。完成后 `offset == capacity`。
+---
 
-也可以先判断再调用：
+### 4.4 消息边界对齐（上层主动控制裁切）
+
+**`evict(tokenCount:)` 是 token 级原语**，它不知道"消息"的概念。如果直接用
+`evictToWindow()`，窗口边界可能恰好落在一条消息中间，导致半截消息留在 cache 里，理解出偏差。
+
+**推荐做法：上层（smlx）维护每条消息的 token 起止位置，裁切时对齐到消息边界。**
 
 ```swift
-if let s = c as? StreamingKVCache, s.needsEviction {
-    s.evictToWindow()
+/// 消息 token 范围示例
+struct MessageTokenRange {
+    let messageIndex: Int
+    let tokenStart: Int   // 在完整 prompt token 序列中的起始位置
+    let tokenEnd: Int     // 在完整 prompt token 序列中的结束位置（不含）
+}
+
+/// 上层淘汰逻辑
+func evictAlignedToMessageBoundary(
+    cache: [KVCache],
+    messageRanges: [MessageTokenRange],
+    keep: Int  // sink token 数
+) -> Int {  // 返回丢弃的完整消息数
+    guard let first = cache.first as? StreamingKVCache,
+          first.needsEviction else { return 0 }
+
+    // 需要丢弃的最小 token 数
+    let minEvict = first.offset - first.capacity
+
+    // 向后对齐到消息边界：找到「丢完后，第一条保留消息的 tokenStart」
+    var tokensToEvict = 0
+    var messagesDropped = 0
+    for range in messageRanges {
+        // 跳过 sink 区域内的消息（它们被 keep 保护，不会被丢）
+        if range.tokenEnd <= keep { continue }
+        let msgTokens = range.tokenEnd - max(range.tokenStart, keep)
+        if tokensToEvict + msgTokens <= minEvict || tokensToEvict < minEvict {
+            tokensToEvict += msgTokens
+            messagesDropped += 1
+        } else {
+            break
+        }
+    }
+    // 确保至少丢够 minEvict 个 token（宁可多丢一条完整消息，也不截断）
+    if tokensToEvict < minEvict {
+        // 需要多丢一条消息来覆盖
+        // ...根据实际情况继续累加
+    }
+
+    // 对所有层执行相同的淘汰
+    for c in cache {
+        (c as? StreamingKVCache)?.evict(tokenCount: tokensToEvict)
+    }
+
+    // 从消息列表中同步删除被丢弃的消息
+    // messageRanges.removeFirst(messagesDropped)
+    return messagesDropped
 }
 ```
 
-> ⚠️ 不要在解码每一步都调 `evictToWindow()`（虽然单测验证了它在逐 token 循环里也能保持
-> 位置有界且数值稳定），更自然的做法是在**轮与轮之间**淘汰一次，减少不必要的旋转。
+**关键**：淘汰后，下一次构建 prompt 时，**不要再包含被丢弃的消息**。因为框架的
+`LLMModel.prepare()` 靠 `cache.offset` 做"盲跳"（跳过前 `offset` 个 token），它假设
+prompt 的前 `offset` 个 token 与 cache 中的 KV 完全一致。如果 smlx 仍然带上已被丢弃的
+消息，token 序列就跟 cache 内容对不上，会产生错误输出。
 
 ---
 
@@ -192,8 +259,11 @@ let (restored, meta) = try loadPromptCache(url: url)
 
 1. 按层数构造 `[StreamingKVCache(...)]`，RoPE 参数来自模型 config；
 2. 把这个数组通过 `cache:` 传给 `TokenIterator` / `generate`，**跨轮复用同一个数组**；
-3. 每轮生成结束后、下一轮 prefill 之前，对每个 cache 调一次 `evictToWindow()`；
-4. 仅适用于标准 / 线性 RoPE，且接受「远期上下文有损遗忘」。
+3. 每轮生成结束后、下一轮 prefill 之前：
+   - （推荐）算好要丢几条完整消息的 token 数，调 `evict(tokenCount:)`；
+   - （简单版）直接调 `evictToWindow()` 一刀切到 capacity；
+4. **同步删除被丢弃的消息**，下次构建 prompt 不再包含它们；
+5. 仅适用于标准 / 线性 RoPE，且接受「远期上下文有损遗忘」。
 
 ---
 
@@ -213,4 +283,7 @@ swift test --filter StreamingKVCacheTests
 - `sinkTokensAreUntouched`：sink 跨淘汰逐位不变；
 - `noEvictionWhenWithinCapacity`：未超容量时为空操作；
 - `repeatedEvictionStaysBounded`：长解码循环中位置始终 ≤ capacity 且无 NaN；
+- `evictExactTokenCount`：`evict(tokenCount:)` 精确裁切指定数量，结果与 ground truth 一致；
+- `evictClampsToAvailable`：请求超额时自动 clamp 到可用量，不 crash；
+- `evictToWindowMatchesExplicitEvict`：`evictToWindow()` 等价于 `evict(tokenCount: overflow)`；
 - `serializationRoundTripPreservesConfigAndState` / `copyIsIndependent`：序列化与拷贝语义正确。
