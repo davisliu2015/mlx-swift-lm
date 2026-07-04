@@ -791,12 +791,34 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, MTPCap
         }
     }
 
+    /// Hybrid 模型（16 层 full-attn + 48 层 GatedDeltaNet）。
+    /// 当 `parameters.maxKVSize` 有值时，full-attn 层用 `StreamingKVCache`；
+    /// DeltaNet 层始终用 `MambaCache`（递归状态，无法按 token 裁剪）。
+    /// 不传 maxKVSize 时保持原有行为（KVCacheSimple）。
+    ///
+    /// RoPE 参数来自 config.json：
+    ///   - ropeDimensions = headDim * partial_rotary_factor = 256 * 0.25 = 64
+    ///   - ropeBase       = rope_theta（10_000_000 for Qwen3.6-27B）
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        guard let windowSize = parameters?.maxKVSize else {
+            // 回退原有行为
+            return model.layers.map { layer in
+                layer.isLinear ? MambaCache() : KVCacheSimple()
+            }
+        }
+        let ropeDims = Int(Float(configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads)) * configuration.partialRotaryFactor)
         return model.layers.map { layer in
             if layer.isLinear {
                 return MambaCache()
             }
-            return KVCacheSimple()
+            return StreamingKVCache(
+                keep: 4,
+                windowSize: windowSize,
+                ropeDimensions: max(1, ropeDims),
+                ropeBase: configuration.ropeTheta,
+                ropeTraditional: false,
+                ropeScale: 1.0  // Qwen3.6 rope_parameters.type = "default"，无缩放
+            )
         }
     }
 

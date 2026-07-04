@@ -202,6 +202,38 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
         return out
     }
 
+    /// 纯 dense 模型（全层 full-attention）。
+    /// 当 `parameters.maxKVSize` 有值时，用 `StreamingKVCache`（attention sink + 滑动窗口）；
+    /// 否则回退 `KVCacheSimple`（保持原有行为）。
+    ///
+    /// RoPE 参数直接来自 config.json，与模型推理完全一致：
+    ///   - ropeDimensions = headDim（Qwen3 无 partial_rotary_factor，全 headDim 旋转）
+    ///   - ropeBase      = rope_theta
+    ///   - ropeScale     = 1/factor（仅 linear 缩放时），否则 1.0
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        guard let windowSize = parameters?.maxKVSize else {
+            return kvHeads.map { _ in KVCacheSimple() }
+        }
+        let ropeScale: Float
+        if let scaling = configuration.ropeScaling,
+           scaling["type"] == .string("linear"),
+           let factor = scaling["factor"]?.asFloat() {
+            ropeScale = 1 / factor
+        } else {
+            ropeScale = 1.0
+        }
+        return kvHeads.map { _ in
+            StreamingKVCache(
+                keep: 4,
+                windowSize: windowSize,
+                ropeDimensions: configuration.headDim,
+                ropeBase: configuration.ropeTheta,
+                ropeTraditional: false,
+                ropeScale: ropeScale
+            )
+        }
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = weights
 
