@@ -1151,8 +1151,14 @@ func applyUniformRoPEShift(
         cosValues[i] = Float(Foundation.cos(angle))
         sinValues[i] = Float(Foundation.sin(angle))
     }
-    let cosV = MLXArray(cosValues)  // shape [half], broadcasts over the head dim
-    let sinV = MLXArray(sinValues)
+    // IMPORTANT: cast the rotation factors to the key dtype (e.g. bf16/fp16).
+    // `MLXArray([Float])` is float32; multiplying fp16 keys by an fp32 factor would
+    // type-promote the whole result to float32, and since `evict()` reassigns
+    // `self.keys = concatenated([...])`, the entire KV buffer would silently become
+    // float32 — doubling KV bandwidth and permanently slowing decode after the first
+    // eviction. Keeping the factors in the key dtype preserves the original precision.
+    let cosV = MLXArray(cosValues).asType(x.dtype)  // shape [half], broadcasts over the head dim
+    let sinV = MLXArray(sinValues).asType(x.dtype)
 
     // Split off any non-rotary tail (partial rotary embeddings) to pass through untouched.
     let xr = rotaryDims < d ? x[.ellipsis, ..<rotaryDims] : x
@@ -1320,13 +1326,6 @@ public class StreamingKVCache: KVCacheSimple {
         self.keys = concatenated([sinkKeys, shiftedWinKeys], axis: 2)
         self.values = concatenated([sinkValues, winValues], axis: 2)
         self.offset = valid - evict
-
-        // Materialize immediately so that subsequent append operations work on a flat
-        // GPU buffer rather than an unevaluated concatenated graph node.
-        // Without this, every following decode step would re-expand the nested graph,
-        // causing sustained ~30% throughput regression after each eviction.
-        eval(self.keys!, self.values!)
-
         return evict
     }
 
