@@ -1320,6 +1320,13 @@ public class StreamingKVCache: KVCacheSimple {
         self.keys = concatenated([sinkKeys, shiftedWinKeys], axis: 2)
         self.values = concatenated([sinkValues, winValues], axis: 2)
         self.offset = valid - evict
+
+        // Materialize immediately so that subsequent append operations work on a flat
+        // GPU buffer rather than an unevaluated concatenated graph node.
+        // Without this, every following decode step would re-expand the nested graph,
+        // causing sustained ~30% throughput regression after each eviction.
+        eval(self.keys!, self.values!)
+
         return evict
     }
 
