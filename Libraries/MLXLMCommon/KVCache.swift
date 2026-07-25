@@ -1300,6 +1300,8 @@ public class StreamingKVCache: KVCacheSimple {
         let evict = min(tokenCount, valid - keep)
         guard evict > 0 else { return 0 }
 
+        print("[StreamingKVCache.evict] ENTER valid=\(valid) keep=\(keep) evict=\(evict) oldOffset=\(offset)")
+
         // Materialize the currently-valid region.
         let validKeys = keys[.ellipsis, ..<valid, 0...]
         let validValues = values[.ellipsis, ..<valid, 0...]
@@ -1326,6 +1328,7 @@ public class StreamingKVCache: KVCacheSimple {
         self.keys = concatenated([sinkKeys, shiftedWinKeys], axis: 2)
         self.values = concatenated([sinkValues, winValues], axis: 2)
         self.offset = valid - evict
+        print("[StreamingKVCache.evict] EXIT newOffset=\(self.offset) keys.shape=\(self.keys?.shape.description ?? "nil") dtype=\(String(describing: self.keys?.dtype))")
         return evict
     }
 

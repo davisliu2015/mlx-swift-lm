@@ -1061,10 +1061,81 @@ public class Qwen35: Module, VLMModel {
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
         MLXArray]
     {
+        // 若 lm_head 有量化参数 (.scales / .biases)，提前反量化为 float，
+        // 因为 VLM LanguageModel 的 lmHead 是 Linear（非 QuantizedLinear）。
+        var weights = sanitizeLMHeadIfQuantized(weights)
+
         if metadata["format"]?.lowercased() == "mlx" {
-            return weights
+            return sanitizeWeightsOnly(weights)
         }
         return sanitize(weights: weights)
+    }
+
+    /// 若存在 language_model.lm_head.scales —— 说明 lm_head 被量化了（6-bit affine），
+    /// 反量化 weight 并移除 scales/biases，让 Linear 直接加载 float 权重。
+    private func sanitizeLMHeadIfQuantized(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weightKey = "language_model.lm_head.weight"
+        let scalesKey = "language_model.lm_head.scales"
+        let biasesKey = "language_model.lm_head.biases"
+        guard let qWeight = weights[weightKey],
+              let scales = weights[scalesKey],
+              let biases = weights[biasesKey] else {
+            return weights
+        }
+        var result = weights
+        result[weightKey] = MLX.dequantized(
+            qWeight, scales: scales, biases: biases,
+            groupSize: 64, bits: 6)
+        result.removeValue(forKey: scalesKey)
+        result.removeValue(forKey: biasesKey)
+        return result
+    }
+    /// 仅做 key 重命名 + conv1d 转轴 + MXFP4 biases 补齐，
+    /// 用于已量化的 MLX 格式权重。
+    private func sanitizeWeightsOnly(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var sanitized: [String: MLXArray] = [:]
+        sanitized.reserveCapacity(weights.count + 100)
+
+        // 先做 key 重命名，跳过 MTP 权重（VLM 路径不需要）
+        var renamed: [String: (MLXArray, String)] = [:]
+        for (key, value) in weights where !key.hasPrefix("mtp") && !key.contains(".mtp.") {
+            var newKey = key
+            if key.contains("model.visual") {
+                newKey = key.replacingOccurrences(of: "model.visual", with: "vision_tower")
+            } else if key.contains("model.language_model") {
+                newKey = key.replacingOccurrences(
+                    of: "model.language_model", with: "language_model.model")
+            } else if key.hasPrefix("model.") {
+                newKey = "language_model." + key
+            } else if key.contains("lm_head") && !key.hasPrefix("language_model.") {
+                newKey = key.replacingOccurrences(of: "lm_head", with: "language_model.lm_head")
+            }
+            renamed[newKey] = (value, key)
+        }
+
+        // MXFP4 格式只有 .scales 无 .biases：为 Linear 层的 .scales 补零值 .biases
+        // 运行时由 QuantizedLinear/QuantizedEmbedding 根据 mode 判断是否实际使用。
+        for (k, (value, _)) in renamed where k.hasSuffix(".scales") && !k.contains("embed_tokens") {
+            let biasKey = String(k.dropLast(".scales".count) + ".biases")
+            if renamed[biasKey] == nil {
+                sanitized[biasKey] = MLXArray.zeros(value.shape, dtype: value.dtype)
+            }
+        }
+
+        // 输出时处理转轴
+        for (k, (value, _)) in renamed {
+            var v = value
+            if k.contains("conv1d.weight") && v.dim(-1) != 1 && v.ndim == 3 {
+                v = v.movedAxis(source: 2, destination: 1)
+            }
+            // vision tower Conv3d：原始 [out, in, D, H, W] → MLX [out, D, H, W, in]
+            if k.contains("vision_tower") && k.hasSuffix(".weight") && v.ndim == 5 && v.shape[1] == 3 {
+                v = v.movedAxis(source: 1, destination: v.ndim - 1)
+            }
+            sanitized[k] = v
+        }
+
+        return sanitized
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -1101,7 +1172,7 @@ public class Qwen35: Module, VLMModel {
                     // `model.language_model.*`. Mirror the LLM-side fallback.
                     key = "language_model." + key
                 }
-            } else if key.contains("lm_head") {
+            } else if key.contains("lm_head") && !key.hasPrefix("language_model.") {
                 key = key.replacingOccurrences(of: "lm_head", with: "language_model.lm_head")
             }
 
