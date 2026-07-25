@@ -1061,10 +1061,67 @@ public class Qwen35: Module, VLMModel {
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
         MLXArray]
     {
+        // MXFP4 等 MLX 格式需要 key 重命名（model.visual → vision_tower 等）
         if metadata["format"]?.lowercased() == "mlx" {
-            return weights
+            return sanitizeWeightsOnly(weights)
         }
         return sanitize(weights: weights)
+    }
+
+    /// Key 重命名 + conv1d/Conv3d 转轴 + MTP 过滤 + MXFP4 biases 补齐，
+    /// 用于已量化的 MLX 格式权重。
+    private func sanitizeWeightsOnly(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var sanitized: [String: MLXArray] = [:]
+        sanitized.reserveCapacity(weights.count)
+
+        var renamed: [String: (MLXArray, String)] = [:]
+
+
+        for (key, value) in weights where !key.hasPrefix("mtp") && !key.contains(".mtp.") {
+            var newKey = key
+            if key.contains("model.visual") {
+                newKey = key.replacingOccurrences(of: "model.visual", with: "vision_tower")
+            } else if key.contains("model.language_model") {
+                newKey = key.replacingOccurrences(
+                    of: "model.language_model", with: "language_model.model")
+            } else if key.hasPrefix("model.") {
+                newKey = "language_model." + key
+            } else if key.contains("lm_head") && !key.hasPrefix("language_model.") {
+                newKey = key.replacingOccurrences(of: "lm_head", with: "language_model.lm_head")
+            }
+            renamed[newKey] = (value, key)
+        }
+
+        // mlx-swift 0.31.4+ 原生支持 MXFP4（不需要 biases）
+        let hasUnsanitizedConv1d = renamed.contains { k, v in
+            k.contains("conv1d.weight") && v.0.dim(-1) != 1
+        }
+        let normSuffixes = [
+            ".input_layernorm.weight",
+            ".post_attention_layernorm.weight",
+            "model.norm.weight",
+            ".q_norm.weight",
+            ".k_norm.weight",
+        ]
+
+        for (k, (value, _)) in renamed {
+            var v = value
+            if k.contains("conv1d.weight") && v.dim(-1) != 1 && v.ndim == 3 {
+                v = v.movedAxis(source: 2, destination: 1)
+            }
+            if k.contains("vision_tower") && k.hasSuffix(".weight") && v.ndim == 5 && v.shape[1] == 3 {
+                v = v.movedAxis(source: 1, destination: v.ndim - 1)
+            }
+            // Norm bias 偏移（与 LLM Qwen35TextModel.sanitize 对齐）
+            if hasUnsanitizedConv1d && normSuffixes.contains(where: { k.hasSuffix($0) })
+                && v.ndim == 1
+            {
+                v = v + MLXArray(1, dtype: v.dtype)
+            }
+            sanitized[k] = v
+        }
+
+        return sanitized
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -1101,7 +1158,7 @@ public class Qwen35: Module, VLMModel {
                     // `model.language_model.*`. Mirror the LLM-side fallback.
                     key = "language_model." + key
                 }
-            } else if key.contains("lm_head") {
+            } else if key.contains("lm_head") && !key.hasPrefix("language_model.") {
                 key = key.replacingOccurrences(of: "lm_head", with: "language_model.lm_head")
             }
 
