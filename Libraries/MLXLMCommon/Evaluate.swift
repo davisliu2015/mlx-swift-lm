@@ -1069,6 +1069,14 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             processor?.didSample(token: token)
             y = .init(tokens: token)
             eval(y.tokens)
+            pendingTokens.append(token.item(Int.self))  // ← yield first token
+
+            // MTP 需要 hidden_{P-1}（prepare 时的 hidden state），不是 hidden_P
+            // MTP 架构: hidden_t + token_{t+1} → 预测 token_{t+2}
+            if let allHidden = model.lastForwardHiddenStates {
+                let seqLen = allHidden.dim(1)
+                lastHiddenStates = allHidden[0..., (seqLen - 1)..., 0...]
+            }
         }
 
         generateDraft(cacheCommit: nil)
@@ -1094,6 +1102,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
             let verifyId = verifyToken.item(Int.self)
             let draftId = draftToken.item(Int.self)
+
 
             if verifyId == draftId {
                 // ★ ACCEPT: draft hit
@@ -1143,10 +1152,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                     }
                 }
 
-                // MTP cache also needs rollback
-                for c in mtpCache where c.isTrimmable {
-                    c.trim(1)
-                }
+                // MTP cache: draft token 未经过 MTP 前向（只采样了 logits），
+                // cache 中只有 confirmed token 的 KV，不应 trim。
+                // 原代码 trim(1) 会误删 confirmed token，导致 MTP 无历史上下文。
 
                 pendingTokens.append(verifyId)
                 processor?.didSample(token: verifyToken)
@@ -1187,8 +1195,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let mtpLogits: MLXArray?
 
         if let commit = cacheCommit {
-            // Optimized path: commit position only updates KV cache (skips norm + lm_head),
-            // then current position gets full computation including lm_head.
             mtpLogits = model.mtpForwardWithCommit(
                 y.tokens, hiddenStates: hidden,
                 commitToken: commit.token, commitHidden: commit.hidden,

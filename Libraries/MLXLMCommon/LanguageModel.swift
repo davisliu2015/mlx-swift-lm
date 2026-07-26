@@ -288,6 +288,13 @@ public protocol MTPCapableModel: LanguageModel {
 
     /// Create a new MTP cache (typically just `[KVCacheSimple()]` since MTP has 1 transformer layer).
     func newMTPCache() -> [KVCache]
+
+    /// Hidden states from the last forward pass (e.g., from prepare).
+    ///
+    /// Used by MTP speculative decoding to get the backbone hidden state
+    /// without re-running the backbone. The MTP head needs the hidden state
+    /// **before** the next token is processed (position t-1), not after.
+    var lastForwardHiddenStates: MLXArray? { get }
 }
 
 /// Default implementations for MTPCapableModel.
@@ -295,6 +302,9 @@ extension MTPCapableModel {
     public func newMTPCache() -> [KVCache] {
         [KVCacheSimple()]
     }
+
+    /// Default: no hidden states available.
+    public var lastForwardHiddenStates: MLXArray? { nil }
 
     /// Default fallback: concatenate commit + current and call standard mtpForward.
     /// Models can override this to provide an optimized implementation that skips
@@ -310,8 +320,10 @@ extension MTPCapableModel {
             [commitToken.reshaped(1, 1), tokenIds.reshaped(1, 1)], axis: 1)
         guard let logits = mtpForward(combinedTokens, hiddenStates: combinedHidden, cache: cache)
         else { return nil }
-        // Return only the last position's logits
-        return logits[0..., -1, 0...][.newAxis, .newAxis]
+        // Return only the last position's logits, keeping 3D shape [1, 1, vocab]
+        // (-1 removes the dimension which causes downstream crash; use range slice to keep it)
+        let lastIdx = logits.dim(1) - 1
+        return logits[0..., lastIdx ..< (lastIdx + 1), 0...]
     }
 }
 

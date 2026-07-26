@@ -520,7 +520,8 @@ enum Qwen35Language {
         func callAsFunction(
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
-            cache: MambaCache? = nil
+            cache: MambaCache? = nil,
+            nConfirmed: Int = 0
         ) -> MLXArray {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
@@ -542,6 +543,97 @@ enum Qwen35Language {
                 mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
             }
 
+            // nConfirmed 两块处理：confirmed → 存快照，draft → 可回滚
+            if nConfirmed > 0 && nConfirmed < S {
+                // --- Chunk 1: Confirmed tokens ---
+                let qkvC = mixedQKV[0..., ..<nConfirmed, 0...]
+                let bC = b[0..., ..<nConfirmed, 0...]
+                let aC = a[0..., ..<nConfirmed, 0...]
+                let zC = z[0..., ..<nConfirmed, 0..., 0...]
+                let maskC = mask?[0..., ..<nConfirmed]
+
+                let convInputC = concatenated([convState, qkvC], axis: 1)
+                let convStateC = convInputC[0..., (-(convKernelSize - 1))...]
+
+                let convOutC = silu(conv1d(convInputC))
+                let splitC = MLX.split(convOutC, indices: [keyDim, 2 * keyDim], axis: -1)
+                let qC = splitC[0].reshaped(B, nConfirmed, numKHeads, headKDim)
+                let kC = splitC[1].reshaped(B, nConfirmed, numKHeads, headKDim)
+                let vC = splitC[2].reshaped(B, nConfirmed, numVHeads, headVDim)
+
+                let dtypeC = qC.dtype
+                let invScaleC = pow(Float(headKDim), -0.5)
+                let qNormedC =
+                    MLXArray(pow(invScaleC, 2)).asType(dtypeC)
+                    * MLXFast.rmsNorm(qC, weight: MLXArray.mlxNone, eps: 1e-6)
+                let kNormedC =
+                    MLXArray(invScaleC).asType(dtypeC)
+                    * MLXFast.rmsNorm(kC, weight: MLXArray.mlxNone, eps: 1e-6)
+
+                var stateC = cache?[1]
+                var outC: MLXArray
+                (outC, stateC) = gatedDeltaUpdate(
+                    q: qNormedC, k: kNormedC, v: vC,
+                    a: aC, b: bC, aLog: aLog, dtBias: dtBias,
+                    state: stateC, mask: maskC
+                )
+                outC = norm(outC, gate: zC)
+
+                // ★ 保存快照 ★
+                if let cache {
+                    var snapshotState = [MLXArray]()
+                    snapshotState.append(convStateC[.ellipsis])
+                    if let s = stateC {
+                        snapshotState.append(s[.ellipsis])
+                    }
+                    cache.rollbackState = snapshotState
+                }
+
+                // --- Chunk 2: Draft tokens ---
+                let nDraft = S - nConfirmed
+                let qkvD = mixedQKV[0..., nConfirmed..., 0...]
+                let bD = b[0..., nConfirmed..., 0...]
+                let aD = a[0..., nConfirmed..., 0...]
+                let zD = z[0..., nConfirmed..., 0..., 0...]
+                let maskD = mask?[0..., nConfirmed...]
+
+                let convInputD = concatenated([convStateC, qkvD], axis: 1)
+                let convStateD = convInputD[0..., (-(convKernelSize - 1))...]
+
+                let convOutD = silu(conv1d(convInputD))
+                let splitD = MLX.split(convOutD, indices: [keyDim, 2 * keyDim], axis: -1)
+                let qD = splitD[0].reshaped(B, nDraft, numKHeads, headKDim)
+                let kD = splitD[1].reshaped(B, nDraft, numKHeads, headKDim)
+                let vD = splitD[2].reshaped(B, nDraft, numVHeads, headVDim)
+
+                let dtypeD = qD.dtype
+                let qNormedD =
+                    MLXArray(pow(invScaleC, 2)).asType(dtypeD)
+                    * MLXFast.rmsNorm(qD, weight: MLXArray.mlxNone, eps: 1e-6)
+                let kNormedD =
+                    MLXArray(invScaleC).asType(dtypeD)
+                    * MLXFast.rmsNorm(kD, weight: MLXArray.mlxNone, eps: 1e-6)
+
+                var stateD = stateC
+                var outD: MLXArray
+                (outD, stateD) = gatedDeltaUpdate(
+                    q: qNormedD, k: kNormedD, v: vD,
+                    a: aD, b: bD, aLog: aLog, dtBias: dtBias,
+                    state: stateD, mask: maskD
+                )
+                outD = norm(outD, gate: zD)
+
+                if let cache {
+                    cache[0] = convStateD
+                    cache[1] = stateD
+                }
+
+                let outFull = concatenated(
+                    [outC.reshaped(B, nConfirmed, -1), outD.reshaped(B, nDraft, -1)], axis: 1)
+                return outProj(outFull)
+            }
+
+            // 普通路径（无 nConfirmed）
             let convInput = concatenated([convState, mixedQKV], axis: 1)
             if let cache, convKernelSize > 1 {
                 cache[0] = convInput[0..., (-(convKernelSize - 1))...]
@@ -677,11 +769,12 @@ enum Qwen35Language {
             attentionMask: MLXArray?,
             ssmMask: MLXArray?,
             cache: KVCache?,
-            positionIds: MLXArray?
+            positionIds: MLXArray?,
+            nConfirmed: Int = 0
         ) -> MLXArray {
             let r: MLXArray
             if isLinear {
-                r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+                r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache, nConfirmed: nConfirmed)
             } else {
                 r = selfAttn!(
                     inputLayerNorm(x), mask: attentionMask, cache: cache, positionIds: positionIds)
@@ -718,7 +811,8 @@ enum Qwen35Language {
             _ inputs: MLXArray,
             inputsEmbeds: MLXArray? = nil,
             cache: [KVCache?]? = nil,
-            positionIds: MLXArray? = nil
+            positionIds: MLXArray? = nil,
+            nConfirmed: Int = 0
         ) -> MLXArray {
             var hiddenStates: MLXArray
             if let inputsEmbeds {
@@ -749,7 +843,8 @@ enum Qwen35Language {
                     attentionMask: faMask,
                     ssmMask: layerSSMMask,
                     cache: cacheArray?[index],
-                    positionIds: positionIds
+                    positionIds: positionIds,
+                    nConfirmed: layer.isLinear ? nConfirmed : 0
                 )
             }
 
@@ -769,6 +864,9 @@ enum Qwen35Language {
 
         /// Whether MTP speculative decoding is available
         var hasMTP: Bool { mtp != nil }
+
+        /// 缓存最后一次 forward 的 hidden states（供 MTP 使用）
+        fileprivate var _lastHiddenStates: MLXArray?
 
         init(_ config: Qwen35Configuration) {
             self.config = config
@@ -796,38 +894,48 @@ enum Qwen35Language {
         // MARK: - MTP Methods
 
         /// Forward pass returning (logits, hiddenStates) for MTP speculative decoding.
+        /// 走完整 VLM callAsFunction 路径（position IDs、mask、state 全部正确）。
         func forwardWithHiddenStates(
-            _ inputs: MLXArray, cache: [KVCache]? = nil
-        ) -> (logits: MLXArray, hiddenStates: MLXArray) {
-            // [KVCache] → [KVCache?] 类型转换
+            _ inputs: MLXArray, cache: [KVCache]?, state: LMOutput.State?, nConfirmed: Int = 0
+        ) -> (logits: MLXArray, hiddenStates: MLXArray, nextState: LMOutput.State) {
             let typedCache: [KVCache?]? = cache?.map { $0 as KVCache? }
-            let h = model(inputs, inputsEmbeds: nil, cache: typedCache, positionIds: nil)
-            let logits: MLXArray
-            if let lmHead {
-                logits = lmHead(h)
-            } else {
-                logits = model.embedTokens.asLinear(h)
-            }
-            return (logits, h)
+            let output = self(
+                inputs,
+                inputsEmbeds: nil,
+                cache: typedCache,
+                state: state,
+                mask: nil,
+                positionIds: nil,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil,
+                nConfirmed: nConfirmed
+            )
+            return (output.logits, _lastHiddenStates!, output.state!)
         }
 
         /// MTP head forward: given token IDs and backbone hidden states, produce draft logits.
         func mtpForward(
-            _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?
+            _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?,
+            positionIds: MLXArray?
         ) -> MLXArray? {
             guard let mtp else { return nil }
             let tokenEmb = model.embedTokens(tokenIds)
             let eNormed = mtp.eNorm(tokenEmb)
             let hNormed = mtp.hNorm(hiddenStates)
+            // vLLM qwen3_next_mtp 参考实现确认：[embedding, hidden] 顺序
+            // torch.cat([inputs_embeds, hidden_states], dim=-1)
             let combined = MLX.concatenated([eNormed, hNormed], axis: -1)
             var x = mtp.fc(combined)
             let faMaskMode = createAttentionMask(h: x, cache: cache?.first)
             let mask: MLXArray?
             if case .array(let a) = faMaskMode { mask = a } else { mask = nil }
-            x = mtp.layers[0](x, mask: mask, cache: cache?.first)
+            x = mtp.layers[0](x, mask: mask, cache: cache?.first, positionIds: positionIds)
             x = mtp.norm(x)
-            if let lmHead { return lmHead(x) }
-            else { return model.embedTokens.asLinear(x) }
+            let logits: MLXArray
+            if let lmHead { logits = lmHead(x) }
+            else { logits = model.embedTokens.asLinear(x) }
+            return logits
         }
 
         /// Create new MTP KV cache (single layer for MTP head).
@@ -847,10 +955,21 @@ enum Qwen35Language {
                 let stripped = key.replacingOccurrences(of: "language_model.mtp.", with: "")
                 mtpParams[stripped] = value
             }
-            // 将 flat dict 转为 NestedDictionary，用 verify=.none 跳过检查
+            // 逐个子模块 update，确保数组子模块（layers）也能加载
             let flatPairs = Array(mtpParams)
             let nested = NestedItem<String, MLXArray>.unflattened(flatPairs)
+
+            // 先用整体 update（加载 fc, norm, eNorm, hNorm）
             try? mtp.update(parameters: ModuleParameters(item: nested), verify: .none)
+
+            // 单独 update layers[0]（绕过可能的数组处理问题）
+            if case .dictionary(let tree) = nested,
+               case .array(let layerItems) = tree["layers"] ?? .none,
+               layerItems.count > 0
+            {
+                try? mtp.layers[0].update(
+                    parameters: ModuleParameters(item: layerItems[0]), verify: .none)
+            }
         }
 
         // MARK: -
@@ -864,7 +983,8 @@ enum Qwen35Language {
             positionIds providedPositionIds: MLXArray? = nil,
             pixelValues: MLXArray? = nil,
             imageGridTHW: [THW]? = nil,
-            videoGridTHW: [THW]? = nil
+            videoGridTHW: [THW]? = nil,
+            nConfirmed: Int = 0
         ) -> LMOutput {
             var state = state ?? .init()
 
@@ -940,17 +1060,24 @@ enum Qwen35Language {
                 }
             }
 
-            var out = model(
+            var hiddenStates = model(
                 inputs,
                 inputsEmbeds: inputsEmbeds,
                 cache: cache,
-                positionIds: positionIds
+                positionIds: positionIds,
+                nConfirmed: nConfirmed
             )
 
+            // 缓存 hidden states 供 MTP forwardWithHiddenStates 使用
+            // vLLM 参考确认：主模型返回 POST-norm hidden states 给 MTP
+            // MTP 的 pre_fc_norm_hidden 会再次 normalize（double-norm 是正确行为）
+            _lastHiddenStates = hiddenStates
+
+            var out: MLXArray
             if let lmHead {
-                out = lmHead(out)
+                out = lmHead(hiddenStates)
             } else {
-                out = model.embedTokens.asLinear(out)
+                out = model.embedTokens.asLinear(hiddenStates)
             }
 
             return LMOutput(logits: out, state: state)
@@ -970,93 +1097,61 @@ enum Qwen35Language {
     }
     // MARK: - MTP (Speculative Decoding)
 
-    /// MTP attention: 48 query heads, 4 KV heads, head_dim=256, o_proj input=6144
-    final class MTPAttention: Module {
-        let numHeads = 48
-        let numKVHeads = 4
-        let headDim = 256
-        let scale: Float
+    /// GemmaRMSNorm: `x * (1 + w) / rms(x)` — 与标准 RMSNorm (`x * w / rms(x)`) 不同。
+    ///
+    /// Qwen3.5/3.6 的所有 norm 层（包括 MTP）都使用 GemmaRMSNorm。
+    /// 权重训练时以 `1 + w` 为有效缩放因子（初始化为 0，有效初始值为 1）。
+    /// 用标准 RMSNorm 会导致有效权重错误（如 w=-0.44 时有效权重为 -0.44 而非 0.56），
+    /// 造成符号翻转和反相关输出。
+    /// 参考: vLLM `vllm.model_executor.layers.layernorm.GemmaRMSNorm`
+    final class GemmaRMSNorm: Module {
+        @ParameterInfo(key: "weight") var weight: MLXArray
+        let eps: Float
 
-        @ModuleInfo(key: "q_proj") var qProj: Linear
-        @ModuleInfo(key: "k_proj") var kProj: Linear
-        @ModuleInfo(key: "v_proj") var vProj: Linear
-        @ModuleInfo(key: "o_proj") var oProj: Linear
-        @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-        @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
-
-        init(_ args: Qwen35Configuration.TextConfiguration) {
-            self.scale = pow(Float(256), -0.5)
-            _qProj.wrappedValue = Linear(args.hiddenSize, 48 * 256, bias: false)
-            _kProj.wrappedValue = Linear(args.hiddenSize, 4 * 256, bias: false)
-            _vProj.wrappedValue = Linear(args.hiddenSize, 4 * 256, bias: false)
-            _oProj.wrappedValue = Linear(6144, args.hiddenSize, bias: false)
-            _qNorm.wrappedValue = RMSNorm(dimensions: 256, eps: args.rmsNormEps)
-            _kNorm.wrappedValue = RMSNorm(dimensions: 256, eps: args.rmsNormEps)
-            super.init()
+        init(dimensions: Int, eps: Float = 1e-6) {
+            _weight.wrappedValue = MLXArray.zeros([dimensions])
+            self.eps = eps
         }
 
-        func callAsFunction(_ x: MLXArray, mask: MLXArray?, cache: KVCache?) -> MLXArray {
-            let B = x.dim(0)
-            let L = x.dim(1)
-
-            var q = qProj(x).reshaped(B, L, numHeads, headDim).transposed(0, 2, 1, 3)
-            var k = kProj(x).reshaped(B, L, numKVHeads, headDim).transposed(0, 2, 1, 3)
-            let v = vProj(x).reshaped(B, L, numKVHeads, headDim).transposed(0, 2, 1, 3)
-
-            q = qNorm(q)
-            k = kNorm(k)
-
-            // 简单 1D RoPE
-            let offset = cache?.offset ?? 0
-            let offsetArr = MLXArray(Int32(offset))
-            q = MLXFast.RoPE(q, dimensions: headDim, traditional: true, base: 100000.0, scale: 1.0, offset: offsetArr)
-            k = MLXFast.RoPE(k, dimensions: headDim, traditional: true, base: 100000.0, scale: 1.0, offset: offsetArr)
-
-            // KV cache 更新
-            let kOut: MLXArray
-            let vOut: MLXArray
-            if let cache {
-                (kOut, vOut) = cache.update(keys: k, values: v)
-            } else {
-                kOut = k
-                vOut = v
-            }
-
-            // Scaled dot product attention（内部处理 GQA）
-            let output = MLXFast.scaledDotProductAttention(
-                queries: q, keys: kOut, values: vOut, scale: scale, mask: mask
-            )  // (B, numHeads, L, headDim)
-
-            // o_proj 取前 24 个 head（6144 / 256 = 24）
-            let half = output[.ellipsis, ..<24, .ellipsis, .ellipsis]
-                .transposed(0, 2, 1, 3)
-                .reshaped(B, L, 6144)
-            return oProj(half)
+        func callAsFunction(_ x: MLXArray) -> MLXArray {
+            let rms = sqrt(mean(x * x, axis: -1, keepDims: true) + eps)
+            return x / rms * (1.0 + weight)
         }
     }
 
     /// MTP block: single-layer transformer (attn + MLP) for draft prediction.
+    /// Attention 直接复用 backbone 的 Attention 类（自带 gate + M-RoPE）。
+    /// 维度从权重反推：24 heads, 4 kv_heads, head_dim=256
+    ///   q_proj: 12288 = 24 * 256 * 2 (gate)  ← 2x 是 gate 机制
+    ///   k_proj: 1024  = 4 * 256
+    ///   o_proj: 6144  = 24 * 256 (无 gate)
     final class MTPBlock: Module {
-        @ModuleInfo(key: "self_attn") var selfAttn: MTPAttention
+        @ModuleInfo(key: "self_attn") var selfAttn: Attention
         @ModuleInfo(key: "mlp") var mlp: MLP
-        @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
-        @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+        @ModuleInfo(key: "input_layernorm") var inputLayerNorm: GemmaRMSNorm
+        @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: GemmaRMSNorm
 
         init(_ args: Qwen35Configuration.TextConfiguration) {
-            _selfAttn.wrappedValue = MTPAttention(args)
+            var mtpArgs = args
+            mtpArgs.attentionHeads = 24
+            mtpArgs.kvHeads = 4
+            mtpArgs.headDim = 256
+            _selfAttn.wrappedValue = Attention(mtpArgs)
+
             _mlp.wrappedValue = MLP(dimensions: args.hiddenSize, hiddenDimensions: args.intermediateSize)
-            _inputLayerNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
-            _postAttentionLayerNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+            _inputLayerNorm.wrappedValue = GemmaRMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+            _postAttentionLayerNorm.wrappedValue = GemmaRMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
             super.init()
         }
 
         func callAsFunction(
             _ x: MLXArray,
             mask: MLXArray?,
-            cache: KVCache?
+            cache: KVCache?,
+            positionIds: MLXArray?
         ) -> MLXArray {
             var r = inputLayerNorm(x)
-            r = selfAttn(r, mask: mask, cache: cache)
+            r = selfAttn(r, mask: mask, cache: cache, positionIds: positionIds)
             r = x + r
             let n = postAttentionLayerNorm(r)
             let m = mlp(n)
@@ -1066,18 +1161,18 @@ enum Qwen35Language {
 
     /// MTP module: shared across all layers for draft token prediction
     final class MTPModule: Module {
-        @ModuleInfo(key: "pre_fc_norm_embedding") var eNorm: RMSNorm
-        @ModuleInfo(key: "pre_fc_norm_hidden") var hNorm: RMSNorm
+        @ModuleInfo(key: "pre_fc_norm_embedding") var eNorm: GemmaRMSNorm
+        @ModuleInfo(key: "pre_fc_norm_hidden") var hNorm: GemmaRMSNorm
         @ModuleInfo(key: "fc") var fc: Linear
         @ModuleInfo(key: "layers") var layers: [MTPBlock]
-        @ModuleInfo(key: "norm") var norm: RMSNorm
+        @ModuleInfo(key: "norm") var norm: GemmaRMSNorm
 
         init(_ args: Qwen35Configuration.TextConfiguration) {
-            _eNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
-            _hNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+            _eNorm.wrappedValue = GemmaRMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+            _hNorm.wrappedValue = GemmaRMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
             _fc.wrappedValue = Linear(args.hiddenSize * 2, args.hiddenSize, bias: false)
             _layers.wrappedValue = [MTPBlock(args)]
-            _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+            _norm.wrappedValue = GemmaRMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
             super.init()
         }
     }
@@ -1085,7 +1180,7 @@ enum Qwen35Language {
 
 // MARK: - Model
 
-public class Qwen35: Module, VLMModel {
+public class Qwen35: Module, VLMModel, MTPCapableModel {
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
@@ -1094,6 +1189,14 @@ public class Qwen35: Module, VLMModel {
 
     /// MTP 权重在 sanitize 中被捕获，模型加载后需手动注入
     nonisolated(unsafe) private static var pendingMTPWeights: [String: MLXArray] = [:]
+
+    /// 缓存 prepare 的 state（position IDs 等），供 forwardWithHiddenStates 复用
+    private var _mtpState: LMOutput.State?
+
+    /// 主模型 KV cache 的引用，供 MTP 动态读取当前 position（避免 rejection trim 后位置过期）。
+    /// 之前 MTP 的 Attention 用自身 KV cache offset (0,1,2...) 做 M-RoPE，
+    /// 导致位置完全错误（应为 prompt_length, prompt_length+1, ...），输出近乎均匀分布。
+    private var _mainCache: [KVCache]?
 
     public let config: Qwen35Configuration
 
@@ -1232,6 +1335,8 @@ public class Qwen35: Module, VLMModel {
             videoGridTHW: videoFrames
         )
 
+        _mtpState = output.state  // 缓存 state 供 forwardWithHiddenStates 使用
+        _mainCache = typedCache  // 保存主模型 cache 引用（供 MTP 动态读取 position）
         return .logits(output)
     }
 
@@ -1274,21 +1379,90 @@ public class Qwen35: Module, VLMModel {
         guard !Self.pendingMTPWeights.isEmpty else { return }
         languageModel.loadMTPWeights(Self.pendingMTPWeights)
         Self.pendingMTPWeights = [:]
-        print("✅ [Qwen35] MTP weights loaded manually (\(languageModel.hasMTP))")
+        if languageModel.hasMTP {
+            print("✅ [Qwen35] MTP enabled")
+        }
     }
 
-    // MARK: - MTP 推理接口（透传到 LanguageModel）
+    // MARK: - MTP 推理接口（MTPCapableModel 协议）
+
+    /// Hidden states from the last forward pass (prepare or forwardWithHiddenStates).
+    /// MTP speculative decoding uses this to get the backbone hidden state
+    /// **before** the next token is processed (position t-1).
+    public var lastForwardHiddenStates: MLXArray? {
+        languageModel._lastHiddenStates
+    }
 
     public func forwardWithHiddenStates(
-        _ inputs: MLXArray, cache: [KVCache]? = nil
+        _ inputs: MLXArray, cache: [KVCache]?, nConfirmed: Int
     ) -> (logits: MLXArray, hiddenStates: MLXArray) {
-        languageModel.forwardWithHiddenStates(inputs, cache: cache)
+        let typedCache: [KVCache?]? = cache?.map { $0 as KVCache? }
+        let output = languageModel(
+            inputs,
+            inputsEmbeds: nil,
+            cache: typedCache,
+            state: _mtpState,  // ← 复用 prepare 的 state（position IDs）
+            mask: nil,
+            positionIds: nil,
+            pixelValues: nil,
+            imageGridTHW: nil,
+            videoGridTHW: nil,
+            nConfirmed: nConfirmed
+        )
+        _mtpState = output.state  // 更新 state 供下次使用
+
+        // ★ 保存主模型 cache 引用，供 MTP 动态读取 position（rejection trim 后也能拿到正确值）
+        _mainCache = cache
+
+        return (output.logits, languageModel._lastHiddenStates!)
+    }
+
+    // LanguageModel 协议：简化前向（无 state，返回 logits）
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let typedCache: [KVCache?]? = cache?.map { $0 as KVCache? }
+        let output = languageModel(
+            inputs, inputsEmbeds: nil, cache: typedCache, state: nil,
+            mask: nil, positionIds: nil, pixelValues: nil,
+            imageGridTHW: nil, videoGridTHW: nil
+        )
+        return output.logits
     }
 
     public func mtpForward(
         _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?
     ) -> MLXArray? {
-        languageModel.mtpForward(tokenIds, hiddenStates: hiddenStates, cache: cache)
+            // 从主模型 cache 动态读取 position（rejection trim 后也能拿到正确值）
+            let mtpPosition: Int
+            if let mainCache = _mainCache {
+                let faIdx = languageModel.model.faIdx
+                mtpPosition = faIdx < mainCache.count ? mainCache[faIdx].offset : 0
+            } else {
+                mtpPosition = 0
+            }
+
+            // MTP 处理的 hidden states 来自主模型位置 [mtpPosition-L, ..., mtpPosition-1]
+            let L = tokenIds.dim(1)
+            let B = tokenIds.dim(0)
+            let startPos = mtpPosition - L
+
+            var delta = MLXArray(Int32(startPos)).asType(.int32)
+            if let ropeDeltas = _mtpState?[ropeDeltasKey] {
+                delta = delta + ropeDeltas.asType(.int32)
+            }
+            if delta.ndim == 0 {
+                delta = broadcast(delta, to: [B])
+            } else if delta.dim(0) < B {
+                delta = repeated(delta, count: B, axis: 0)
+            } else if delta.dim(0) > B {
+                delta = delta[0 ..< B]
+            }
+
+            var base = MLXArray(0 ..< L).asType(.int32)
+            base = broadcast(base[.newAxis, 0...], to: [B, L])
+            base = base + delta[0..., .newAxis]
+            let positionIds = broadcast(base[.newAxis, 0..., 0...], to: [3, B, L])
+
+            return languageModel.mtpForward(tokenIds, hiddenStates: hiddenStates, cache: cache, positionIds: positionIds)
     }
 
     public func newMTPCache() -> [KVCache] {
