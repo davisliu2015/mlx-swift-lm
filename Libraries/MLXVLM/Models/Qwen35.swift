@@ -1011,17 +1011,18 @@ enum Qwen35Language {
 
             var positionIds = providedPositionIds
             if positionIds == nil && (ropeMask == nil || ropeMask?.ndim == 2) {
-                if (cache != nil && cache?[model.faIdx] != nil && cacheOffset == 0)
+                // ★ 使用缓存的 position IDs：仅在 chunk prefill 内部（prefill 的总长度 > 当前 cacheOffset）
+                //    排除 text generation 场景（prefill 长度 ≤ cacheOffset，缓存位置已"用完"）
+                if let precomputedPositionIds, precomputedPositionIds.dim(-1) > cacheOffset {
+                    let seqLength = inputs.dim(1)
+                    positionIds =
+                        precomputedPositionIds[
+                            0..., 0..., cacheOffset ..< (cacheOffset + seqLength)]
+                } else if (cache != nil && cache?[model.faIdx] != nil && cacheOffset == 0)
                     || ropeDeltas == nil
                     || cache == nil
                 {
-                    if let precomputedPositionIds {
-                        let seqLength = inputs.dim(1)
-                        positionIds =
-                            precomputedPositionIds[
-                                0..., 0..., cacheOffset ..< (cacheOffset + seqLength)]
-                    } else {
-                        let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
+                    let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
                             inputIds: inputs,
                             imageGridTHW: imageGridTHW,
                             videoGridTHW: videoGridTHW,
@@ -1033,7 +1034,6 @@ enum Qwen35Language {
                         positionIds = computed
                         state[precomputedPositionIdsKey] = computed
                         state[ropeDeltasKey] = deltas
-                    }
                 } else {
                     let batchSize = inputs.dim(0)
                     let seqLength = inputs.dim(1)
@@ -1198,6 +1198,10 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
     /// 导致位置完全错误（应为 prompt_length, prompt_length+1, ...），输出近乎均匀分布。
     private var _mainCache: [KVCache]?
 
+    /// Chunked prefill 进度回调 (已处理 token 数, 总数)。
+    /// smlx 侧 set 此回调后，prepare() 会在每个 chunk 完成后调用。
+    public var prefillProgressCallback: (@Sendable (_ processed: Int, _ total: Int) -> Void)?
+
     public let config: Qwen35Configuration
 
     public init(_ config: Qwen35Configuration) {
@@ -1279,8 +1283,9 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
     public func prepare(
         _ input: LMInput,
         cache: [any KVCache],
-        windowSize _: Int?
+        windowSize: Int?
     ) throws -> PrepareResult {
+        let prefillStepSize = windowSize ?? 512
         let inputIds = input.text.tokens
 
         var pixelValues: MLXArray?
@@ -1322,22 +1327,94 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
             inputEmbeddings = mergedEmbeds
         }
 
+        // inputIds is [batch, seq], use dim(1) for sequence length
+        let totalLength = inputIds.dim(1)
         let typedCache = castCache(cache)
-        let output = languageModel(
-            inputIds,
-            inputsEmbeds: inputEmbeddings,
-            cache: typedCache,
-            state: nil,
-            mask: input.text.mask,
-            positionIds: nil,
-            pixelValues: pixelValues,
-            imageGridTHW: imageFrames,
-            videoGridTHW: videoFrames
-        )
+        var state: LMOutput.State?
+        var lastOutput: LMOutput?
 
-        _mtpState = output.state  // 缓存 state 供 forwardWithHiddenStates 使用
+        if totalLength > prefillStepSize {
+            // ★ Chunked prefill：分块处理长序列，降低 prefill 显存峰值
+            // 关键：在 prepare 阶段用完整 inputIds 算好 position IDs，
+            // 然后按 chunk 切片喂给 languageModel（避免 chunk 内部 getRopeIndex 失败）
+            print("🚀 [Qwen35] chunked prefill ENTER totalLength=\(totalLength) stepSize=\(prefillStepSize) callbackSet=\(prefillProgressCallback != nil)")
+
+            // 一次性算好完整序列的 3D position IDs（需要 imageGridTHW 等完整 context）
+            var precomputedState: LMOutput.State? = nil
+            var fullPositionIds: MLXArray? = nil
+            if pixelValues != nil {
+                let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
+                    inputIds: inputIds,
+                    imageGridTHW: imageFrames,
+                    videoGridTHW: videoFrames,
+                    spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+                    imageTokenId: config.imageTokenId,
+                    videoTokenId: config.videoTokenId,
+                    visionStartTokenId: config.visionStartTokenId,
+                    attentionMask: input.text.mask
+                )
+                precomputedState = .init()
+                precomputedState?[precomputedPositionIdsKey] = computed
+                precomputedState?[ropeDeltasKey] = deltas
+                fullPositionIds = computed
+            }
+
+            var offset = 0
+            while offset < totalLength {
+                let chunkEnd = min(offset + prefillStepSize, totalLength)
+                let chunkIds = inputIds[0..., offset ..< chunkEnd]
+                let chunkEmbeds = inputEmbeddings?[0..., offset ..< chunkEnd, 0...]
+
+                // 取本 chunk 的 position IDs 切片
+                let chunkPosIds: MLXArray?
+                if let fullPositionIds {
+                    chunkPosIds = fullPositionIds[0..., 0..., offset ..< chunkEnd]
+                } else {
+                    chunkPosIds = nil
+                }
+
+                let output = languageModel(
+                    chunkIds,
+                    inputsEmbeds: chunkEmbeds,
+                    cache: typedCache,
+                    state: precomputedState,  // 预计算的位置缓存
+                    mask: nil,                // 不再传 mask（getRopeIndex 已在外层完成）
+                    positionIds: chunkPosIds, // 直接喂预计算的位置
+                    pixelValues: nil,
+                    imageGridTHW: nil,
+                    videoGridTHW: nil
+                )
+                state = output.state
+                lastOutput = output
+                asyncEval(cache)
+                offset = chunkEnd
+                // 每个 chunk 完成时回调进度
+                print("🚀 [Qwen35] chunk done: \(chunkEnd)/\(totalLength) callbackSet=\(prefillProgressCallback != nil)")
+                prefillProgressCallback?(chunkEnd, totalLength)
+            }
+            print("🚀 [Qwen35] chunked prefill DONE")
+            eval(cache)
+        } else {
+            // 小 prompt：一次性前向
+            print("🚀 [Qwen35] single-shot prefill totalLength=\(totalLength) stepSize=\(prefillStepSize) callbackSet=\(prefillProgressCallback != nil)")
+            let output = languageModel(
+                inputIds,
+                inputsEmbeds: inputEmbeddings,
+                cache: typedCache,
+                state: nil,
+                mask: input.text.mask,
+                positionIds: nil,
+                pixelValues: pixelValues,
+                imageGridTHW: imageFrames,
+                videoGridTHW: videoFrames
+            )
+            state = output.state
+            lastOutput = output
+        }
+
+        _mtpState = state  // 缓存 state 供 forwardWithHiddenStates 使用
         _mainCache = typedCache  // 保存主模型 cache 引用（供 MTP 动态读取 position）
-        return .logits(output)
+        return .logits(lastOutput!)
     }
 
     public func callAsFunction(
