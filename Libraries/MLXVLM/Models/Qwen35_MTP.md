@@ -282,18 +282,34 @@ let tokenEmb = model.embedTokens(tokenIds)
 VLM 版本目前用协议默认实现 (concat 2 tokens 后一起 forward)，
 未来可以借鉴 LLM 版本的优化。
 
-### 4.2 LLM 版本可能也需要 GemmaRMSNorm
+### 4.2 LLM 版本的 GemmaRMSNorm 处理: sanitize 时权重 +1
 
-LLM 版本的 `Qwen35MTPBlock` 使用标准 `RMSNorm`:
+LLM 版本使用标准 `RMSNorm`，但在 `sanitize()` 中通过 **权重偏移** 处理 GemmaRMSNorm:
 
 ```swift
-// MTPHead.swift
-@ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
-@ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+// MLXLLM/Models/Qwen35.swift - sanitize()
+let shouldShiftNormWeights = hasUnsanitizedConv1d  // 检测原始 HF checkpoint
+
+if shouldShiftNormWeights
+    && normKeys.contains(where: { k.hasSuffix($0) })
+    && v.ndim == 1
+{
+    weights[k] = v + MLXArray(1, dtype: v.dtype)  // w → w + 1
+}
 ```
 
-如果 LLM 版本的 checkpoint 也使用 GemmaRMSNorm 权重 (与 VLM 相同)，
-则 LLM 版本可能也存在同样的反相关问题。需要验证 LLM 版本的 norm 权重值。
+**两种处理方式对比:**
+
+| | LLM 版本 (sanitize) | VLM 版本 (GemmaRMSNorm 类) |
+|---|---|---|
+| **方法** | 加载时 `w → w + 1`，用标准 RMSNorm | 保持原始 `w`，用 `GemmaRMSNorm` 类 |
+| **公式** | `x/rms(x) * (w+1)` | `x/rms(x) * (1+w)` |
+| **数学等价** | ✅ 相同 | ✅ 相同 |
+| **修改范围** | 所有 norm 权重（含主模型） | 只改 MTP 的 norm 层 |
+| **优点** | 无需自定义类，改动小 | 不修改权重，更直观 |
+| **缺点** | 修改了原始权重值 | 需要自定义 `GemmaRMSNorm` 类 |
+
+**结论**: LLM 版本不需要额外修改，它已通过 `sanitize()` 中的 `shouldShiftNormWeights` 正确处理。
 
 ---
 
