@@ -1790,11 +1790,13 @@ public func generate(
     // Check if the model supports MTP
     guard useMTP, let mtpModel = context.model as? (any MTPCapableModel), mtpModel.hasMTP else {
         // Fall back to standard generation
+        if useMTP { print("🚀 [MTP] model does not support MTP, falling back to standard generation") }
         return try generate(
             input: input, cache: cache, parameters: parameters, context: context,
             wiredMemoryTicket: wiredMemoryTicket, tools: tools)
     }
 
+    print("🚀 [MTP] speculative decoding active")
     let iterator = try MTPSpeculativeTokenIterator(
         input: input,
         model: mtpModel,

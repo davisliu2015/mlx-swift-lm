@@ -1,7 +1,7 @@
 # Qwen3.5/3.6 MTP (Multi-Token Prediction) 支持文档
 
 > 本文档记录了在 mlx-swift-lm 中为 Qwen3.5/3.6 VLM 模型实现 MTP 投机解码的完整过程，
-> 包括架构分析、7 个关键 bug 的根因与修复，以及 VLM 与 LLM 实现的对比。
+> 包括架构分析、7 个关键 bug 的根因与修复，VLM 与 LLM 实现的对比，以及 StreamingKVCache 与 M-RoPE 的兼容性分析。
 
 ## 目录
 
@@ -9,7 +9,8 @@
 - [2. 核心数据流](#2-核心数据流)
 - [3. 遇到的 7 个问题及修复](#3-遇到的-7-个问题及修复)
 - [4. VLM 与 LLM 实现对比](#4-vlm-与-llm-实现对比)
-- [5. 关键文件清单](#5-关键文件清单)
+- [5. StreamingKVCache × M-RoPE 兼容性分析](#5-streamingkvcache--m-rope-兼容性分析)
+- [6. 关键文件清单](#6-关键文件清单)
 
 ---
 
@@ -250,7 +251,8 @@ return logits[0..., lastIdx ..< (lastIdx + 1), 0...]  // 保持 3D [1, 1, vocab]
 
 | 方面 | VLM (`MLXVLM/Qwen35.swift`) | LLM (`MLXLLM/Qwen35.swift` + `MTPHead.swift`) |
 |------|------------------------------|------------------------------------------------|
-| **Norm 类型** | `GemmaRMSNorm` (自定义) | `RMSNorm` (标准) ⚠️ 可能也需要改为 GemmaRMSNorm |
+| **Norm 类型** | `GemmaRMSNorm` (自定义类，运行时处理) | `RMSNorm` (标准) + `sanitize` 时权重 +1 |
+| **GemmaRMSNorm 处理** | 运行时：`x/rms(x) * (1+w)` | 加载时：`w → w+1`，然后用标准 RMSNorm | 
 | **Attention 类** | 复用 backbone `Attention` (gated + M-RoPE) | 专用 `Qwen35Attention` (标准 RoPE) |
 | **Position IDs** | 从主模型 cache 动态计算 3D M-RoPE | 不需要显式 position IDs (标准 RoPE 从 cache offset 推导) |
 | **mtpForward 签名** | `mtpForward(tokenIds, hiddenStates, cache, positionIds)` | `mtpForward(tokenIds, hiddenStates, cache)` (无 positionIds) |
@@ -260,10 +262,20 @@ return logits[0..., lastIdx ..< (lastIdx + 1), 0...]  // 保持 3D [1, 1, vocab]
 | **M-RoPE** | 需要 (3D position IDs: text/height/width) | 不需要 (纯文本用 1D RoPE) |
 | **ropeDeltas** | 需要 (图像位置偏移) | 不需要 |
 
-### 4.1 LLM 版本的优化: 自定义 mtpForwardWithCommit
+### 4.1 两种 GemmaRMSNorm 处理方式的对比
 
-LLM 版本 (`Qwen35TextModel`) 有一个**自定义的 `mtpForwardWithCommit`**，
-比协议默认实现更高效：
+| | LLM 版本 (sanitize) | VLM 版本 (GemmaRMSNorm 类) |
+|---|---|---|
+| **方法** | 加载时 `w → w + 1`，用标准 RMSNorm | 保持原始 `w`，用 `GemmaRMSNorm` 类 |
+| **公式** | `x/rms(x) * (w+1)` | `x/rms(x) * (1+w)` |
+| **数学等价** | ✅ 相同 | ✅ 相同 |
+| **修改范围** | 所有 norm 权重（含主模型） | 只改 MTP 的 norm 层 |
+| **优点** | 无需自定义类，改动小 | 不修改权重，更直观 |
+| **缺点** | 修改了原始权重值 | 需要自定义 `GemmaRMSNorm` 类 |
+
+### 4.2 LLM 版本的优化: 自定义 mtpForwardWithCommit
+
+LLM 版本有一个**自定义的 `mtpForwardWithCommit`**，比协议默认实现更高效：
 
 ```swift
 // LLM 版本: 分开处理 commit 和 current
@@ -279,49 +291,147 @@ let tokenEmb = model.embedTokens(tokenIds)
 **优势**: 省一次 `lm_head` 矩阵乘 (hidden_size × vocab_size = 5120 × 248320)，
 对 27B 模型每次 accept 节省约 2.5 GFLOPs。
 
-VLM 版本目前用协议默认实现 (concat 2 tokens 后一起 forward)，
-未来可以借鉴 LLM 版本的优化。
-
-### 4.2 LLM 版本的 GemmaRMSNorm 处理: sanitize 时权重 +1
-
-LLM 版本使用标准 `RMSNorm`，但在 `sanitize()` 中通过 **权重偏移** 处理 GemmaRMSNorm:
-
-```swift
-// MLXLLM/Models/Qwen35.swift - sanitize()
-let shouldShiftNormWeights = hasUnsanitizedConv1d  // 检测原始 HF checkpoint
-
-if shouldShiftNormWeights
-    && normKeys.contains(where: { k.hasSuffix($0) })
-    && v.ndim == 1
-{
-    weights[k] = v + MLXArray(1, dtype: v.dtype)  // w → w + 1
-}
-```
-
-**两种处理方式对比:**
-
-| | LLM 版本 (sanitize) | VLM 版本 (GemmaRMSNorm 类) |
-|---|---|---|
-| **方法** | 加载时 `w → w + 1`，用标准 RMSNorm | 保持原始 `w`，用 `GemmaRMSNorm` 类 |
-| **公式** | `x/rms(x) * (w+1)` | `x/rms(x) * (1+w)` |
-| **数学等价** | ✅ 相同 | ✅ 相同 |
-| **修改范围** | 所有 norm 权重（含主模型） | 只改 MTP 的 norm 层 |
-| **优点** | 无需自定义类，改动小 | 不修改权重，更直观 |
-| **缺点** | 修改了原始权重值 | 需要自定义 `GemmaRMSNorm` 类 |
-
-**结论**: LLM 版本不需要额外修改，它已通过 `sanitize()` 中的 `shouldShiftNormWeights` 正确处理。
+VLM 版本目前用协议默认实现，未来可以借鉴 LLM 版本的优化。
 
 ---
 
-## 5. 关键文件清单
+## 5. StreamingKVCache × M-RoPE 兼容性分析
+
+### 5.1 StreamingKVCache 工作原理
+
+`StreamingKVCache` 采用 **Attention Sink + 滑动窗口** 策略：
+
+1. 永久保留开头的少量 **sink token**（`keep` 个，如 system prompt 或前几个 token）
+2. 只保留最近的 `windowSize` 个 token
+3. **关键操作**：淘汰旧 token 后，对幸存窗口 token 的 key 做**均匀 RoPE 旋转移位**（`applyUniformRoPEShift`），把位置平移回 `[keep, keep+windowSize)` 区间
+
+核心数学恒等式（`StreamingKVCacheTests.swift` 验证）：
+```
+R(δ) · R(p) = R(p + δ)
+```
+即：对已烘焙的 key 施加均匀旋转，等价于在新位置重新烘焙。
+
+### 5.2 M-RoPE 的工作原理
+
+VLM 使用 **M-RoPE**（multidimensional rotary position embedding），位置 IDs 是 3D 的：
+```
+positionIds = [3, batch, seq]   ← [text_position, image_height_position, image_width_position]
+```
+
+不同频率维度使用不同的位置分量（由 `mropeSection: [11, 11, 10]` 控制）：
+- 前 11 个基础频率 → `text_position`
+- 中间 11 个 → `image_height`
+- 后 10 个 → `image_width`
+
+### 5.3 关键分析
+
+`applyUniformRoPEShift` 对**所有** rotary 维度施加相同的旋转角度 δ。这个操作：
+
+**对标准 1D RoPE 成立** ✅：
+```
+每个维度 i: angle_i = δ / θ_i
+所有维度用同一个 δ → uniform shift 正确
+```
+
+**对 M-RoPE 需要分情况讨论**：
+
+#### 情况 A: 纯文本生成 (text_position = height = width)
+
+所有位置分量相同，M-RoPE ≈ 1D RoPE：
+```
+positionIds = [3, 1, 1] = [[p], [p], [p]]   ← 三个维度相等
+→ 所有频率维度用同一个位置 p
+→ uniform shift 正确 ✅
+```
+
+#### 情况 B: 图像 tokens 在 sink 区域（保留不淘汰）
+
+```
+Sink: [image_token_0, image_token_1, ..., system_prompt, text_0, text_1]  ← 混合 3D 位置
+Window: [text_k, text_{k+1}, ..., text_n]                                   ← 纯文本 (3D 相同)
+
+evict 后:
+- Sink tokens: 不移动，位置不变 ✅
+- Window tokens: 纯文本 → shift 正确 ✅
+```
+
+#### 情况 C: 图像 tokens 在 window 区域内（会被淘汰 / 移位）
+
+```
+Window: [image_token, ..., text_0, text_1]
+
+evict 后如果 image tokens 幸存：
+→ shift 会改变 height/width 维度的位置（但这些维度不应跟随 text 维度 shift）
+→ ⚠️ 产生偏差
+```
+
+但实际场景中**图像几乎总是在 conversation 开头**（system prompt 或第一轮 user message），
+属于 sink 区域或最早被淘汰的内容，不会出现在需要 shift 的 window 中。
+
+### 5.4 量化分析
+
+即使极端情况下图像 tokens 需要 shift，偏差也很有限：
+
+| 参数 | 值 |
+|------|-----|
+| Head dim | 256 |
+| `partialRotaryFactor` | 0.25 |
+| Rotary dims | 256 × 0.25 = 64 |
+| M-RoPE 影响的频率分量 | 32 个（每个分量对应 2 个 rotary dim） |
+| M-RoPE 影响的 rotary dims | 64 (全部 rotary) |
+| **受潜在 shift 偏差影响的比例** | 64/256 = 25% |
+| 但 text 分量 (11/32) shift 正确 | 11/32 = 34% 正确 |
+| 实际偏差比例 | **~41%** 的 rotary dimensions |
+| 偏差占全部 head dim 的比例 | 64×0.41/256 ≈ **10%** |
+
+### 5.5 `ropeDeltas` 和 `precomputedPositionIds` 的处理
+
+StreamingKVCache eviction 后，还需要处理两个位置相关状态：
+
+#### ropeDeltas
+
+```swift
+// Qwen35.swift: ropeDeltas = 图像 tokens 引入的位置偏移
+var delta = MLXArray(cacheOffset) + (ropeDeltas ?? 0)
+```
+
+eviction 后 `cacheOffset` 减少了 `evictCount`，`ropeDeltas` 也需要相应调整：
+- 如果被淘汰的 tokens 不涉及图像 → `ropeDeltas` 不变
+- 如果被淘汰的 tokens 包含图像 → `ropeDeltas` 需要重新计算
+
+#### precomputedPositionIds
+
+prepare 阶段计算的 `precomputedPositionIds` 会被缓存到 `state` 中，用于后续 forward。
+eviction 后这些预计算的位置 IDs 不再有效，需要重新计算或增量更新。
+
+### 5.6 结论
+
+| 场景 | StreamingKVCache 兼容性 | 说明 |
+|------|:---:|------|
+| 纯文本对话 | ✅ 完全兼容 | M-RoPE = 1D RoPE，shift 正确 |
+| 图像在 sink 区域 | ✅ 兼容 | Sink 不 shift，window 纯文本 |
+| 图像在 window 区域且被淘汰 | ✅ 无影响 | 被淘汰了就无所谓 |
+| 图像在 window 区域且幸存 | ⚠️ 有偏差 | 图像相关维度 shift 不正确 (~10% dims) |
+| 多轮图像 (每轮有不同图) | ⚠️ 需谨慎 | `ropeDeltas` 和 `precomputedPositionIds` 需额外处理 |
+
+**推荐策略**：
+1. 将 system prompt 和第一轮（含图片）设为 sink（`keep = 第一轮 token 数`）
+2. 后续纯文本对话在 window 内流转
+3. 如果必须支持多轮图像，每次 evict 后需要重新计算 `ropeDeltas` 和 `precomputedPositionIds`
+
+**StreamingKVCache 文档中的 "⚠️ 不建议" 标记**可以更新为："纯文本和 sink-protected 图像场景下支持，需额外处理 ropeDeltas 和 positionIds 缓存"。
+
+---
+
+## 6. 关键文件清单
 
 | 文件 | 修改内容 |
 |------|----------|
 | `MLXVLM/Models/Qwen35.swift` | GemmaRMSNorm 类、MTPBlock、MTPModule、mtpForward (position IDs)、forwardWithHiddenStates、lastForwardHiddenStates、prepare (_mainCache)、loadMTPWeights |
 | `MLXLMCommon/Evaluate.swift` | MTPSpeculativeTokenIterator: prepare (.logits case 用 lastForwardHiddenStates)、speculateRound、generateDraft |
 | `MLXLMCommon/LanguageModel.swift` | MTPCapableModel 协议 + lastForwardHiddenStates 属性 + mtpForwardWithCommit 默认实现修复 (维度保持) |
-| `MLXLLM/Models/Qwen35.swift` | LLM 版本 (未修改，但可参考其 mtpForwardWithCommit 优化) |
-| `MLXLLM/Models/MTPHead.swift` | LLM MTP 组件 (未修改) |
+| `MLXLLM/Models/Qwen35.swift` | LLM 版本 (sanitize 中 shouldShiftNormWeights 处理 GemmaRMSNorm) |
+| `MLXLLM/Models/MTPHead.swift` | LLM MTP 组件 (标准 RMSNorm + 标准 RoPE) |
 
 ---
 
@@ -332,3 +442,4 @@ if shouldShiftNormWeights
 - **vLLM**: `vllm/model_executor/layers/layernorm.py` — GemmaRMSNorm 公式 `x * (1 + w) / rms(x)`
 - **mlx-qwen-mtp**: https://github.com/quivent/mlx-qwen-mtp — 确认架构 `hidden_t + token_{t+1} → token_{t+2}`、concat [embed, hidden]
 - **SGLang**: `--speculative-algo NEXTN` — 推测解码配置参考
+- **StreamingLLM**: Xiao et al. 2023 — Attention Sink + 滑动窗口策略基础
