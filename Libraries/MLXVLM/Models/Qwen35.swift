@@ -1084,12 +1084,23 @@ enum Qwen35Language {
         }
 
         func makeCache(maxKVSize: Int?) -> [KVCache] {
-            model.layers.map { layer in
+            let headDim = textConfig.headDim ?? (textConfig.hiddenSize / textConfig.attentionHeads)
+            let rotaryDims = max(1, Int(Float(headDim) * textConfig.partialRotaryFactor))
+            let mrope = textConfig.ropeParameters?["mrope_section"]?.asInts() ?? [11, 11, 10]
+            return model.layers.map { layer in
                 if layer.isLinear {
                     return MambaCache()
                 }
                 if let maxKVSize {
-                    return RotatingKVCache(maxSize: maxKVSize, keep: 4)
+                    return StreamingKVCache(
+                        keep: 4,
+                        windowSize: maxKVSize,
+                        ropeDimensions: rotaryDims,
+                        ropeBase: textConfig.ropeTheta,
+                        ropeTraditional: false,
+                        ropeScale: 1.0,
+                        mropeSection: mrope
+                    )
                 }
                 return KVCacheSimple()
             }
@@ -1317,7 +1328,7 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
             let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
             let visionFeatures = visionHidden.asType(textEmbeds.dtype)
 
-            let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
+            let (mergedEmbeds, visualMask) = try mergeInputIdsWithImageFeatures(
                 imageFeatures: visionFeatures,
                 inputEmbeds: textEmbeds,
                 inputIds: inputIds,
@@ -1325,6 +1336,16 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
                 videoTokenIndex: config.videoTokenIndex
             )
             inputEmbeddings = mergedEmbeds
+
+            // ★ 记录每种 token 类型以供随后的 KV 缓存淘汰使用。
+            // image token 需要分段 M-RoPE shift（仅移动文本位置，保持高/宽位置不变）。
+            // 必须在使用语言模型（填充缓存）之前执行此操作。
+            eval(visualMask)
+            let boolMask: [Bool] = visualMask.asArray(Bool.self).map { $0 }
+            let currentOffset = cache.first(where: { !($0 is MambaCache) })?.offset ?? 0
+            for c in cache {
+                (c as? StreamingKVCache)?.updateImageMask(boolMask, from: currentOffset)
+            }
         }
 
         // inputIds is [batch, seq], use dim(1) for sequence length
@@ -1337,7 +1358,6 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
             // ★ Chunked prefill：分块处理长序列，降低 prefill 显存峰值
             // 关键：在 prepare 阶段用完整 inputIds 算好 position IDs，
             // 然后按 chunk 切片喂给 languageModel（避免 chunk 内部 getRopeIndex 失败）
-            print("🚀 [Qwen35] chunked prefill ENTER totalLength=\(totalLength) stepSize=\(prefillStepSize) callbackSet=\(prefillProgressCallback != nil)")
 
             // 一次性算好完整序列的 3D position IDs（需要 imageGridTHW 等完整 context）
             var precomputedState: LMOutput.State? = nil
@@ -1389,14 +1409,11 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
                 asyncEval(cache)
                 offset = chunkEnd
                 // 每个 chunk 完成时回调进度
-                print("🚀 [Qwen35] chunk done: \(chunkEnd)/\(totalLength) callbackSet=\(prefillProgressCallback != nil)")
                 prefillProgressCallback?(chunkEnd, totalLength)
             }
-            print("🚀 [Qwen35] chunked prefill DONE")
             eval(cache)
         } else {
             // 小 prompt：一次性前向
-            print("🚀 [Qwen35] single-shot prefill totalLength=\(totalLength) stepSize=\(prefillStepSize) callbackSet=\(prefillProgressCallback != nil)")
             let output = languageModel(
                 inputIds,
                 inputsEmbeds: inputEmbeddings,

@@ -1191,6 +1191,75 @@ func applyUniformRoPEShift(
     return rotated
 }
 
+// MARK: - M-RoPE Segmented Shift
+
+/// Apply **segmented** RoPE position shift for M-RoPE (Multimodal Rotary Position Embedding).
+///
+/// M-RoPE splits the 32 rotary frequency pairs into groups (e.g. `[11, 11, 10]` for
+/// Qwen3.5) corresponding to `(text_position, image_height, image_width)`. When evicting
+/// older tokens from the KV cache, image visual tokens should only shift their text
+/// position component; height and width components stay fixed (they represent
+/// within-image grid coordinates).
+///
+/// This is the M-RoPE analogue of ``applyUniformRoPEShift(_:delta:dimensions:traditional:base:scale:)``.
+///
+/// - Parameters:
+///   - x: key tensor `[B, kvHeads, L, headDim]`
+///   - deltas: position delta per section, e.g. `[-evict, 0, 0]` for image tokens
+///   - sections: M-RoPE section sizes (frequency pair counts per group)
+///   - dims: total rotary dimensions
+///   - base: RoPE theta base
+/// - Returns: `x` with each section shifted by its corresponding delta.
+func applyMRoPEShift(
+    _ x: MLXArray,
+    deltas: [Int],
+    sections: [Int],
+    dims: Int,
+    base: Float
+) -> MLXArray {
+    let d = x.dim(x.ndim - 1)
+    let rotaryDims = min(dims, d)
+    precondition(rotaryDims % 2 == 0, "RoPE dimensions must be even")
+    let half = rotaryDims / 2
+    precondition(sections.reduce(0, +) == half, "sections sum must equal rotary_dims/2")
+
+    // Precompute per-frequency-pair cos/sin values.
+    // Each section gets its own delta → different rotation angles.
+    var cosValues = [Float](repeating: 0, count: half)
+    var sinValues = [Float](repeating: 0, count: half)
+    var freqIdx = 0
+    for (secIdx, secSize) in sections.enumerated() {
+        let delta = deltas[secIdx]
+        for _ in 0..<secSize {
+            let invFreq = 1.0 / pow(Double(base), Double(2 * freqIdx) / Double(dims))
+            let angle = Double(delta) * invFreq
+            cosValues[freqIdx] = Float(Foundation.cos(angle))
+            sinValues[freqIdx] = Float(Foundation.sin(angle))
+            freqIdx += 1
+        }
+    }
+
+    // Match key dtype to avoid silent float32 promotion (same rationale as
+    // applyUniformRoPEShift).
+    let cosV = MLXArray(cosValues).asType(x.dtype)
+    let sinV = MLXArray(sinValues).asType(x.dtype)
+
+    // NeoX (half-split) layout: rotate pairs (i, i + half).
+    let xr = rotaryDims < d ? x[.ellipsis, ..<rotaryDims] : x
+    let xPass: MLXArray? = rotaryDims < d ? x[.ellipsis, rotaryDims...] : nil
+
+    let x1 = xr[.ellipsis, ..<half]
+    let x2 = xr[.ellipsis, half...]
+    let o1 = x1 * cosV - x2 * sinV
+    let o2 = x2 * cosV + x1 * sinV
+    let rotated = concatenated([o1, o2], axis: -1)
+
+    if let xPass {
+        return concatenated([rotated, xPass], axis: -1)
+    }
+    return rotated
+}
+
 /// Streaming KV cache implementing the "attention sink + sliding window" strategy
 /// (StreamingLLM, Xiao et al. 2023) on top of MLX's *post-RoPE* cache.
 ///
@@ -1243,6 +1312,17 @@ public class StreamingKVCache: KVCacheSimple {
     private var ropeTraditional: Bool
     private var ropeScale: Float
 
+    // M-RoPE support (for VLM models like Qwen3.5/3.6).
+    // When non-nil, evict() applies segmented RoPE shift per position component.
+    // e.g. [11, 11, 10] for Qwen3.5: 11 text freq pairs, 11 height, 10 width.
+    private var mropeSection: [Int]?
+
+    /// Per-position flag: `imageTokenMask[pos] == true` → position `pos` is an image visual token.
+    /// Image tokens need a different RoPE shift than text tokens during eviction
+    /// (height/width position components should not move when text tokens shift).
+    /// All attention layers share the same mask (same position → same token type).
+    private var imageTokenMask: [Bool] = []
+
     /// The maximum number of valid tokens kept after an eviction (`keep + windowSize`).
     public var capacity: Int { keep + windowSize }
 
@@ -1253,13 +1333,15 @@ public class StreamingKVCache: KVCacheSimple {
     ///   - ropeBase: RoPE theta base (the model's `ropeTheta` / `rope_theta`).
     ///   - ropeTraditional: whether RoPE uses the interleaved layout (default `false`).
     ///   - ropeScale: RoPE position scale (`1.0` for none, `1/factor` for linear scaling).
+    ///   - mropeSection: M-RoPE section sizes for segmented shift (nil → uniform shift).
     public init(
         keep: Int = 4,
         windowSize: Int,
         ropeDimensions: Int,
         ropeBase: Float,
         ropeTraditional: Bool = false,
-        ropeScale: Float = 1.0
+        ropeScale: Float = 1.0,
+        mropeSection: [Int]? = nil
     ) {
         precondition(keep >= 0, "keep must be >= 0")
         precondition(windowSize > 0, "windowSize must be > 0")
@@ -1269,7 +1351,29 @@ public class StreamingKVCache: KVCacheSimple {
         self.ropeBase = ropeBase
         self.ropeTraditional = ropeTraditional
         self.ropeScale = ropeScale
+        self.mropeSection = mropeSection
         super.init()
+    }
+
+    /// Record token types for M-RoPE eviction.
+    ///
+    /// Called once per prefill to mark which positions are image visual tokens.
+    /// Subsequent eviction will apply the correct segmented shift to image tokens.
+    ///
+    /// - Parameters:
+    ///   - mask: per-token boolean mask (true = image visual token).
+    ///   - from: starting offset in the cache where these tokens begin.
+    public func updateImageMask(_ mask: [Bool], from startOffset: Int) {
+        guard mropeSection != nil else { return }  // no-op for non-M-RoPE models
+        let newTokens = mask.count
+        let needed = startOffset + newTokens
+        if needed > imageTokenMask.count {
+            imageTokenMask.append(
+                contentsOf: repeatElement(false, count: needed - imageTokenMask.count))
+        }
+        for i in 0..<newTokens {
+            imageTokenMask[startOffset + i] = mask[i]
+        }
     }
 
     /// Whether the cache currently holds more valid tokens than `capacity`.
@@ -1312,20 +1416,98 @@ public class StreamingKVCache: KVCacheSimple {
         // [keep+evict, valid). Re-index them down by `evict` to occupy [keep, valid-evict).
         let winKeys = validKeys[.ellipsis, (keep + evict)..., 0...]
         let winValues = validValues[.ellipsis, (keep + evict)..., 0...]
+        let winLen = valid - (keep + evict)
 
         // Keys carry RoPE position → shift. Values are position-free → untouched.
-        let shiftedWinKeys = applyUniformRoPEShift(
-            winKeys,
-            delta: -evict,
-            dimensions: ropeDimensions,
-            traditional: ropeTraditional,
-            base: ropeBase,
-            scale: ropeScale
-        )
+        let shiftedWinKeys: MLXArray
+        if let sections = mropeSection, winLen > 0,
+           imageTokenMask.count >= valid
+        {
+            // M-RoPE segmented shift: text tokens uniform; image tokens
+            // only shift text component, leave h/w grid positions unchanged.
+            let winStart = keep + evict
+            var textIndices = [Int]()
+            var imageIndices = [Int]()
+            for i in 0..<winLen {
+                let pos = winStart + i
+                if imageTokenMask[pos] {
+                    imageIndices.append(i)
+                } else {
+                    textIndices.append(i)
+                }
+            }
+
+            if imageIndices.isEmpty {
+                // All text → uniform shift (fast path).
+                shiftedWinKeys = applyUniformRoPEShift(
+                    winKeys,
+                    delta: -evict,
+                    dimensions: ropeDimensions,
+                    traditional: ropeTraditional,
+                    base: ropeBase,
+                    scale: ropeScale
+                )
+            } else {
+                // Build shifted output with correct per-token rotation.
+                let zeroedWinKeys = MLXArray.zeros(like: winKeys)
+                var mergedKeys = zeroedWinKeys
+
+                if !textIndices.isEmpty {
+                    let textIdxArr = MLXArray(textIndices.map { Int32($0) })
+                    let textKeys = winKeys[0..., 0..., textIdxArr, 0...]
+                    let shifted = applyUniformRoPEShift(
+                        textKeys,
+                        delta: -evict,
+                        dimensions: ropeDimensions,
+                        traditional: ropeTraditional,
+                        base: ropeBase,
+                        scale: ropeScale
+                    )
+                    for (i, idx) in textIndices.enumerated() {
+                        mergedKeys[0..., 0..., idx, 0...] =
+                            shifted[0..., 0..., i, 0...]
+                    }
+                }
+
+                if !imageIndices.isEmpty {
+                    let imgIdxArr = MLXArray(imageIndices.map { Int32($0) })
+                    let imgKeys = winKeys[0..., 0..., imgIdxArr, 0...]
+                    let shifted = applyMRoPEShift(
+                        imgKeys,
+                        deltas: [-evict, 0, 0],  // text moves, h/w stay
+                        sections: sections,
+                        dims: ropeDimensions,
+                        base: ropeBase
+                    )
+                    for (i, idx) in imageIndices.enumerated() {
+                        mergedKeys[0..., 0..., idx, 0...] =
+                            shifted[0..., 0..., i, 0...]
+                    }
+                }
+
+                shiftedWinKeys = mergedKeys
+            }
+        } else {
+            // Standard RoPE: uniform shift for all tokens.
+            shiftedWinKeys = applyUniformRoPEShift(
+                winKeys,
+                delta: -evict,
+                dimensions: ropeDimensions,
+                traditional: ropeTraditional,
+                base: ropeBase,
+                scale: ropeScale
+            )
+        }
 
         self.keys = concatenated([sinkKeys, shiftedWinKeys], axis: 2)
         self.values = concatenated([sinkValues, winValues], axis: 2)
         self.offset = valid - evict
+
+        // Sync imageTokenMask: drop the evicted region.
+        if evict > 0, imageTokenMask.count >= keep + evict {
+            imageTokenMask.removeSubrange(keep..<(keep + evict))
+        }
+
         return evict
     }
 
@@ -1348,8 +1530,10 @@ public class StreamingKVCache: KVCacheSimple {
             ropeDimensions: ropeDimensions,
             ropeBase: ropeBase,
             ropeTraditional: ropeTraditional,
-            ropeScale: ropeScale
+            ropeScale: ropeScale,
+            mropeSection: mropeSection
         )
+        new.imageTokenMask = self.imageTokenMask
         new.step = self.step
         let s = self.state
         if !s.isEmpty {
