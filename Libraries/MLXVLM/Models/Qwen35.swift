@@ -1351,10 +1351,22 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
         // inputIds is [batch, seq], use dim(1) for sequence length
         let totalLength = inputIds.dim(1)
         let typedCache = castCache(cache)
+        let cacheOffset = typedCache?.first(where: { !($0 is MambaCache) })?.offset ?? 0
+
+        // ★ 增量 prefill：只在纯文本轮次启用（pixelValues 非 nil 说明有新图片 → 全量 prefill）
+        let useIncremental = cacheOffset > 0 && totalLength > cacheOffset && pixelValues == nil
+        let startPos = useIncremental ? cacheOffset : 0
+        let freshLength = totalLength - startPos
+        if useIncremental {
+            print("⚡ [Qwen35] incremental prefill: skip=\(cacheOffset) fresh=\(freshLength)/\(totalLength)")
+        }
+
         var state: LMOutput.State?
         var lastOutput: LMOutput?
 
-        if totalLength > prefillStepSize {
+        // ★ 增量 prefill 时直接单次前向，避免 chunked 拆块把 ~300 tokens 切成 3 块
+        // （每块各要等前一块完成 + asyncEval，单次前向 < 2s，3 块要 12s+）
+        if !useIncremental && freshLength > prefillStepSize {
             // ★ Chunked prefill：分块处理长序列，降低 prefill 显存峰值
             // 关键：在 prepare 阶段用完整 inputIds 算好 position IDs，
             // 然后按 chunk 切片喂给 languageModel（避免 chunk 内部 getRopeIndex 失败）
@@ -1380,15 +1392,17 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
             }
 
             var offset = 0
-            while offset < totalLength {
-                let chunkEnd = min(offset + prefillStepSize, totalLength)
-                let chunkIds = inputIds[0..., offset ..< chunkEnd]
-                let chunkEmbeds = inputEmbeddings?[0..., offset ..< chunkEnd, 0...]
+            while offset < freshLength {
+                let chunkEnd = min(offset + prefillStepSize, freshLength)
+                let absFrom = startPos + offset
+                let absTo = startPos + chunkEnd
+                let chunkIds = inputIds[0..., absFrom ..< absTo]
+                let chunkEmbeds = inputEmbeddings?[0..., absFrom ..< absTo, 0...]
 
                 // 取本 chunk 的 position IDs 切片
                 let chunkPosIds: MLXArray?
                 if let fullPositionIds {
-                    chunkPosIds = fullPositionIds[0..., 0..., offset ..< chunkEnd]
+                    chunkPosIds = fullPositionIds[0..., 0..., absFrom ..< absTo]
                 } else {
                     chunkPosIds = nil
                 }
@@ -1397,9 +1411,9 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
                     chunkIds,
                     inputsEmbeds: chunkEmbeds,
                     cache: typedCache,
-                    state: precomputedState,  // 预计算的位置缓存
-                    mask: nil,                // 不再传 mask（getRopeIndex 已在外层完成）
-                    positionIds: chunkPosIds, // 直接喂预计算的位置
+                    state: precomputedState,
+                    mask: nil,
+                    positionIds: chunkPosIds,
                     pixelValues: nil,
                     imageGridTHW: nil,
                     videoGridTHW: nil
@@ -1408,12 +1422,27 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
                 lastOutput = output
                 asyncEval(cache)
                 offset = chunkEnd
-                // 每个 chunk 完成时回调进度
-                prefillProgressCallback?(chunkEnd, totalLength)
+                prefillProgressCallback?(chunkEnd, freshLength)
             }
             eval(cache)
+        } else if startPos > 0 {
+            // 增量小 prompt：只 prefill cache 之外的新 token
+            let output = languageModel(
+                inputIds[0..., startPos...],
+                inputsEmbeds: inputEmbeddings?[0..., startPos..., 0...],
+                cache: typedCache,
+                state: nil,
+                mask: nil,
+                positionIds: nil,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil
+            )
+            state = output.state
+            lastOutput = output
+            prefillProgressCallback?(freshLength, freshLength)
         } else {
-            // 小 prompt：一次性前向
+            // 全新小 prompt：一次性前向
             let output = languageModel(
                 inputIds,
                 inputsEmbeds: inputEmbeddings,
