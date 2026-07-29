@@ -1420,17 +1420,19 @@ public class StreamingKVCache: KVCacheSimple {
 
         // Keys carry RoPE position → shift. Values are position-free → untouched.
         let shiftedWinKeys: MLXArray
-        if let sections = mropeSection, winLen > 0,
-           imageTokenMask.count >= valid
-        {
+        if let sections = mropeSection, winLen > 0 {
             // M-RoPE segmented shift: text tokens uniform; image tokens
             // only shift text component, leave h/w grid positions unchanged.
+            // 注意：imageTokenMask 只覆盖 prefill 阶段记录的位置，生成 token 无记录。
+            // 缺省按文本（false）处理——生成 token 本来就是文本，不能因此退化为
+            // uniform shift 而错误移动图片 token 的 h/w 分量。
             let winStart = keep + evict
             var textIndices = [Int]()
             var imageIndices = [Int]()
             for i in 0..<winLen {
                 let pos = winStart + i
-                if imageTokenMask[pos] {
+                let isImage = pos < imageTokenMask.count ? imageTokenMask[pos] : false
+                if isImage {
                     imageIndices.append(i)
                 } else {
                     textIndices.append(i)

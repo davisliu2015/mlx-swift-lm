@@ -15,6 +15,10 @@ public enum VLMError: LocalizedError, Equatable {
     case processing(String)
     case noVideoTrackFound
     case videoNotDecodable
+    /// 增量 prefill 前置校验失败：prompt 不是 KV cache 的严格前缀扩展
+    /// （token 数不回退、图片 pad 段与帧网格匹配、无跨 cacheOffset 的图片段）。
+    /// 调用方应重置 session cache 后全量重试。
+    case cacheDiverged
 
     public var errorDescription: String? {
         switch self {
@@ -38,6 +42,8 @@ public enum VLMError: LocalizedError, Equatable {
             return String(localized: "Video file has no video tracks.")
         case .videoNotDecodable:
             return String(localized: "Video file not decodable.")
+        case .cacheDiverged:
+            return String(localized: "Prompt diverged from KV cache; reset the session cache and retry with a full prefill.")
         }
     }
 }

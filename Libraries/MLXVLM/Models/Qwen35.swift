@@ -1018,6 +1018,18 @@ enum Qwen35Language {
                     positionIds =
                         precomputedPositionIds[
                             0..., 0..., cacheOffset ..< (cacheOffset + seqLength)]
+                } else if imageGridTHW == nil && videoGridTHW == nil {
+                    // ★ 纯文本快速路径：位置 = cacheOffset 起的线性绝对位置（M-RoPE 三通道相同）。
+                    // 原先走 getRopeIndex 会对"增量后缀片段"返回 0-based 位置（无前缀上下文），
+                    // 与前缀位置冲突；这里直接按 cacheOffset 连续排布，deltas 记 0
+                    // （供后续 decode 步走 cacheOffset + delta 分支，行为不变）。
+                    let batchSize = inputs.dim(0)
+                    let seqLength = inputs.dim(1)
+                    var base = MLXArray(0 ..< seqLength).asType(.int32)
+                    base = broadcast(base[.newAxis, 0...], to: [batchSize, seqLength])
+                    base = base + MLXArray(Int32(cacheOffset))
+                    positionIds = broadcast(base[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
+                    state[ropeDeltasKey] = MLXArray.zeros([batchSize], dtype: .int32)
                 } else if (cache != nil && cache?[model.faIdx] != nil && cacheOffset == 0)
                     || ropeDeltas == nil
                     || cache == nil
@@ -1298,14 +1310,16 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
     ) throws -> PrepareResult {
         let prefillStepSize = windowSize ?? 512
         let inputIds = input.text.tokens
+        // inputIds is [batch, seq], use dim(1) for sequence length
+        let totalLength = inputIds.dim(1)
+        let typedCache = castCache(cache)
+        let cacheOffset = typedCache?.first(where: { !($0 is MambaCache) })?.offset ?? 0
 
-        var pixelValues: MLXArray?
-        var imageFrames: [THW]?
-        var videoFrames: [THW]?
-
+        // ── 1. 收集图片/视频的像素与帧网格（此处不跑 vision tower）────────────
         let visionDType = visionModel.patchEmbed.proj.weight.dtype
         var pixelParts: [MLXArray] = []
-
+        var imageFrames: [THW]?
+        var videoFrames: [THW]?
         if let image = input.image {
             pixelParts.append(image.pixels.asType(visionDType))
             imageFrames = image.frames
@@ -1314,83 +1328,205 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
             pixelParts.append(video.pixels.asType(visionDType))
             videoFrames = video.frames
         }
-        if !pixelParts.isEmpty {
-            pixelValues = concatenated(pixelParts)
+        let allPixelValues: MLXArray? = pixelParts.isEmpty ? nil : concatenated(pixelParts)
+
+        // ── 2. 扫描 image/video pad token 段并与 frames 做结构校验 ────────────
+        // replacePaddingTokens 展开规则：第 i 段 pad 数 = frame_i.product / mergeSize²，
+        // 且段顺序与 frames 顺序一致。校验通过是增量 prefill 的前提。
+        let mergeSize = config.visionConfiguration.spatialMergeSize
+        let mergeSquare = mergeSize * mergeSize
+        let ids = inputIds.asArray(Int.self)
+        var runs: [(isVideo: Bool, range: Range<Int>)] = []
+        var scanIdx = 0
+        while scanIdx < ids.count {
+            let t = ids[scanIdx]
+            if t == config.imageTokenId || t == config.videoTokenId {
+                var end = scanIdx + 1
+                while end < ids.count && ids[end] == t { end += 1 }
+                runs.append((t == config.videoTokenId, scanIdx ..< end))
+                scanIdx = end
+            } else {
+                scanIdx += 1
+            }
         }
+        let imageRuns = runs.filter { !$0.isVideo }
+        let videoRuns = runs.filter { $0.isVideo }
 
-        var inputEmbeddings: MLXArray?
-
-        if let pixelValues,
-            let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
-                .nilIfEmpty
-        {
-            let textEmbeds = languageModel.model.embedTokens(inputIds)
-            let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
-            let visionFeatures = visionHidden.asType(textEmbeds.dtype)
-
-            let (mergedEmbeds, visualMask) = try mergeInputIdsWithImageFeatures(
-                imageFeatures: visionFeatures,
-                inputEmbeds: textEmbeds,
-                inputIds: inputIds,
-                imageTokenIndex: config.imageTokenIndex,
-                videoTokenIndex: config.videoTokenIndex
-            )
-            inputEmbeddings = mergedEmbeds
-
-            // ★ 记录每种 token 类型以供随后的 KV 缓存淘汰使用。
-            // image token 需要分段 M-RoPE shift（仅移动文本位置，保持高/宽位置不变）。
-            // 必须在使用语言模型（填充缓存）之前执行此操作。
-            eval(visualMask)
-            let boolMask: [Bool] = visualMask.asArray(Bool.self).map { $0 }
-            let currentOffset = cache.first(where: { !($0 is MambaCache) })?.offset ?? 0
-            for c in cache {
-                (c as? StreamingKVCache)?.updateImageMask(boolMask, from: currentOffset)
+        var structureOK =
+            imageRuns.count == (imageFrames?.count ?? 0)
+            && videoRuns.count == (videoFrames?.count ?? 0)
+        if structureOK, let imageFrames {
+            for (run, frame) in zip(imageRuns, imageFrames)
+            where run.range.count != frame.product / mergeSquare {
+                structureOK = false
+                break
+            }
+        }
+        if structureOK, let videoFrames {
+            for (run, frame) in zip(videoRuns, videoFrames)
+            where run.range.count != frame.product / mergeSquare {
+                structureOK = false
+                break
             }
         }
 
-        // inputIds is [batch, seq], use dim(1) for sequence length
-        let totalLength = inputIds.dim(1)
-        let typedCache = castCache(cache)
-        let cacheOffset = typedCache?.first(where: { !($0 is MambaCache) })?.offset ?? 0
-
-        // ★ 增量 prefill：只在纯文本轮次启用（pixelValues 非 nil 说明有新图片 → 全量 prefill）
-        let useIncremental = cacheOffset > 0 && totalLength > cacheOffset && pixelValues == nil
-        let startPos = useIncremental ? cacheOffset : 0
+        // ── 3. 判定增量可行性 ────────────────────────────────────────────────
+        // cacheOffset == 0 → 全新 prefill；
+        // cacheOffset > 0 且 prompt 是 cache 的严格前缀扩展（totalLength > cacheOffset、
+        // 结构校验通过、无跨 cacheOffset 的图片段）→ 增量 prefill；
+        // 否则视为 cache 与 prompt 发散（异常），抛出由上层重置 cache 后全量重试。
+        var startPos = 0
+        var cachedImageCount = 0
+        var cachedVideoCount = 0
+        if cacheOffset > 0 {
+            let canIncrement =
+                structureOK && totalLength > cacheOffset
+                && runs.allSatisfy {
+                    $0.range.upperBound <= cacheOffset || $0.range.lowerBound >= cacheOffset
+                }
+            guard canIncrement else {
+                print(
+                    "⚠️ [Qwen35] cache diverged: offset=\(cacheOffset) total=\(totalLength) "
+                        + "runs=\(runs.map { "\($0.isVideo ? "v" : "i")\($0.range)" }) structureOK=\(structureOK)"
+                )
+                throw VLMError.cacheDiverged
+            }
+            startPos = cacheOffset
+            cachedImageCount = imageRuns.filter { $0.range.upperBound <= cacheOffset }.count
+            cachedVideoCount = videoRuns.filter { $0.range.upperBound <= cacheOffset }.count
+        }
         let freshLength = totalLength - startPos
-        if useIncremental {
-            print("⚡ [Qwen35] incremental prefill: skip=\(cacheOffset) fresh=\(freshLength)/\(totalLength)")
+        if startPos > 0 {
+            print(
+                "⚡ [Qwen35] incremental prefill: skip=\(cacheOffset) fresh=\(freshLength)/\(totalLength) newImages=\(imageRuns.count - cachedImageCount) newVideos=\(videoRuns.count - cachedVideoCount)"
+            )
         }
 
+        // ── 4. vision tower：只跑新增图片/视频（旧图特征已在 KV cache 中）─────
+        // 像素布局：[全部图片行..., 全部视频行...]，每张图行数 = frame.product（patchify）。
+        let imageRowCounts = (imageFrames ?? []).map { $0.product }
+        let videoRowCounts = (videoFrames ?? []).map { $0.product }
+        var pixelValuesToEncode: MLXArray?
+        var framesToEncode: [THW]?
+        if let allPixelValues {
+            if structureOK {
+                let newImageStartRow = imageRowCounts[..<cachedImageCount].reduce(0, +)
+                let newImageRowCount = imageRowCounts[cachedImageCount...].reduce(0, +)
+                let newVideoStartRow =
+                    imageRowCounts.reduce(0, +)
+                    + videoRowCounts[..<cachedVideoCount].reduce(0, +)
+                let newVideoRowCount = videoRowCounts[cachedVideoCount...].reduce(0, +)
+                var newParts: [MLXArray] = []
+                var newFrames: [THW] = []
+                if newImageRowCount > 0 {
+                    newParts.append(
+                        allPixelValues[
+                            newImageStartRow ..< (newImageStartRow + newImageRowCount), 0...])
+                    newFrames.append(contentsOf: (imageFrames ?? [])[cachedImageCount...])
+                }
+                if newVideoRowCount > 0 {
+                    newParts.append(
+                        allPixelValues[
+                            newVideoStartRow ..< (newVideoStartRow + newVideoRowCount), 0...])
+                    newFrames.append(contentsOf: (videoFrames ?? [])[cachedVideoCount...])
+                }
+                if !newParts.isEmpty {
+                    pixelValuesToEncode =
+                        newParts.count == 1 ? newParts[0] : concatenated(newParts)
+                    framesToEncode = newFrames
+                }
+            } else {
+                // 结构异常（仅全新 prefill 可达）：退回旧行为，全量编码 + mask 合并
+                pixelValuesToEncode = allPixelValues
+                framesToEncode = combinedFrames(
+                    imageFrames: imageFrames, videoFrames: videoFrames)
+            }
+        }
+
+        // ── 5. 文本 embedding + 视觉特征合并 ─────────────────────────────────
+        var inputEmbeddings: MLXArray?
+        if let pixelValuesToEncode,
+            let frames = framesToEncode?.nilIfEmpty
+        {
+            let textEmbeds = languageModel.model.embedTokens(inputIds)
+            let (visionHidden, _) = visionModel(pixelValuesToEncode, gridTHW: frames)
+            let visionFeatures = visionHidden.asType(textEmbeds.dtype)
+
+            if structureOK {
+                // 把新图特征写入其 pad token 的绝对位置（旧图位置不在 suffix 中，跳过）。
+                // 注意迭代顺序必须与特征布局一致：[新图片..., 新视频...]（同 pixelParts），
+                // 不能按 token 顺序（两者在图文交错时不同）。
+                let newRunsInFeatureOrder =
+                    imageRuns.filter { $0.range.lowerBound >= startPos }
+                    + videoRuns.filter { $0.range.lowerBound >= startPos }
+                var embeds = textEmbeds
+                var featureOffset = 0
+                for run in newRunsInFeatureOrder {
+                    let n = run.range.count
+                    embeds[0..., run.range, 0...] =
+                        visionFeatures[featureOffset ..< (featureOffset + n), 0...]
+                        .expandedDimensions(axis: 0)
+                    featureOffset += n
+                }
+                guard featureOffset == visionFeatures.dim(0) else {
+                    throw Qwen35VLError.featureTokenMismatch(
+                        expected: featureOffset, actual: visionFeatures.dim(0))
+                }
+                inputEmbeddings = embeds
+            } else {
+                let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
+                    imageFeatures: visionFeatures,
+                    inputEmbeds: textEmbeds,
+                    inputIds: inputIds,
+                    imageTokenIndex: config.imageTokenIndex,
+                    videoTokenIndex: config.videoTokenIndex
+                )
+                inputEmbeddings = mergedEmbeds
+            }
+        }
+
+        // ── 6. 记录新增图片 token 掩码（StreamingKVCache evict 的 M-RoPE 分段 shift）
+        // 旧图的掩码在以往轮次已记录；evict 时会同步裁剪掩码数组，保持对齐。
+        if !runs.isEmpty {
+            var suffixMask = [Bool](repeating: false, count: freshLength)
+            for run in runs where run.range.lowerBound >= startPos {
+                for i in run.range {
+                    suffixMask[i - startPos] = true
+                }
+            }
+            for c in cache {
+                (c as? StreamingKVCache)?.updateImageMask(suffixMask, from: startPos)
+            }
+        }
+
+        // ── 7. 全量 M-RoPE 位置预计算（增量与全量统一）────────────────────────
+        // 后缀位置依赖完整上下文（含旧图 grid），必须一次性算全量再切片；
+        // 纯文本时 getRopeIndex 返回线性绝对位置，切片后同样严格正确。
+        let (fullPositionIds, ropeDeltas) = Qwen3VLLanguage.getRopeIndex(
+            inputIds: inputIds,
+            imageGridTHW: imageFrames,
+            videoGridTHW: videoFrames,
+            spatialMergeSize: mergeSize,
+            imageTokenId: config.imageTokenId,
+            videoTokenId: config.videoTokenId,
+            visionStartTokenId: config.visionStartTokenId,
+            attentionMask: input.text.mask
+        )
+        var precomputedState = LMOutput.State()
+        precomputedState[precomputedPositionIdsKey] = fullPositionIds
+        precomputedState[ropeDeltasKey] = ropeDeltas
+
+        // ── 8. 分块或单次前向（只处理 cache 之外的新增后缀）───────────────────
+        // 增量轮次的后缀通常较小，单次前向比分块更快（分块边界有 asyncEval 等待）；
+        // 后缀超过 512 才分块（如本轮携带多张大图）。
+        let chunkThreshold = startPos > 0 ? max(prefillStepSize, 512) : prefillStepSize
         var state: LMOutput.State?
         var lastOutput: LMOutput?
 
-        // ★ 增量 prefill 时直接单次前向，避免 chunked 拆块把 ~300 tokens 切成 3 块
-        // （每块各要等前一块完成 + asyncEval，单次前向 < 2s，3 块要 12s+）
-        if !useIncremental && freshLength > prefillStepSize {
-            // ★ Chunked prefill：分块处理长序列，降低 prefill 显存峰值
-            // 关键：在 prepare 阶段用完整 inputIds 算好 position IDs，
-            // 然后按 chunk 切片喂给 languageModel（避免 chunk 内部 getRopeIndex 失败）
-
-            // 一次性算好完整序列的 3D position IDs（需要 imageGridTHW 等完整 context）
-            var precomputedState: LMOutput.State? = nil
-            var fullPositionIds: MLXArray? = nil
-            if pixelValues != nil {
-                let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
-                    inputIds: inputIds,
-                    imageGridTHW: imageFrames,
-                    videoGridTHW: videoFrames,
-                    spatialMergeSize: config.visionConfiguration.spatialMergeSize,
-                    imageTokenId: config.imageTokenId,
-                    videoTokenId: config.videoTokenId,
-                    visionStartTokenId: config.visionStartTokenId,
-                    attentionMask: input.text.mask
-                )
-                precomputedState = .init()
-                precomputedState?[precomputedPositionIdsKey] = computed
-                precomputedState?[ropeDeltasKey] = deltas
-                fullPositionIds = computed
-            }
-
+        if freshLength > chunkThreshold {
+            // ★ Chunked prefill：分块处理长序列，降低 prefill 显存峰值。
+            // position IDs 已在外层一次性算好，chunk 内直接切片，
+            // languageModel 检测到 positionIds != nil 后跳过内部位置计算。
             var offset = 0
             while offset < freshLength {
                 let chunkEnd = min(offset + prefillStepSize, freshLength)
@@ -1398,14 +1534,7 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
                 let absTo = startPos + chunkEnd
                 let chunkIds = inputIds[0..., absFrom ..< absTo]
                 let chunkEmbeds = inputEmbeddings?[0..., absFrom ..< absTo, 0...]
-
-                // 取本 chunk 的 position IDs 切片
-                let chunkPosIds: MLXArray?
-                if let fullPositionIds {
-                    chunkPosIds = fullPositionIds[0..., 0..., absFrom ..< absTo]
-                } else {
-                    chunkPosIds = nil
-                }
+                let chunkPosIds = fullPositionIds[0..., 0..., absFrom ..< absTo]
 
                 let output = languageModel(
                     chunkIds,
@@ -1425,15 +1554,15 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
                 prefillProgressCallback?(chunkEnd, freshLength)
             }
             eval(cache)
-        } else if startPos > 0 {
-            // 增量小 prompt：只 prefill cache 之外的新 token
+        } else {
+            // 单次前向（增量小 prompt 或全新小 prompt）
             let output = languageModel(
                 inputIds[0..., startPos...],
                 inputsEmbeds: inputEmbeddings?[0..., startPos..., 0...],
                 cache: typedCache,
-                state: nil,
+                state: precomputedState,
                 mask: nil,
-                positionIds: nil,
+                positionIds: fullPositionIds[0..., 0..., startPos ..< totalLength],
                 pixelValues: nil,
                 imageGridTHW: nil,
                 videoGridTHW: nil
@@ -1441,21 +1570,6 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
             state = output.state
             lastOutput = output
             prefillProgressCallback?(freshLength, freshLength)
-        } else {
-            // 全新小 prompt：一次性前向
-            let output = languageModel(
-                inputIds,
-                inputsEmbeds: inputEmbeddings,
-                cache: typedCache,
-                state: nil,
-                mask: input.text.mask,
-                positionIds: nil,
-                pixelValues: pixelValues,
-                imageGridTHW: imageFrames,
-                videoGridTHW: videoFrames
-            )
-            state = output.state
-            lastOutput = output
         }
 
         _mtpState = state  // 缓存 state 供 forwardWithHiddenStates 使用
