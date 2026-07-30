@@ -1523,6 +1523,9 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
         var state: LMOutput.State?
         var lastOutput: LMOutput?
 
+        // 先上报 0%：单次前向没有中间进度事件，否则 UI 在整个 prefill 期间无反馈
+        prefillProgressCallback?(0, freshLength)
+
         if freshLength > chunkThreshold {
             // ★ Chunked prefill：分块处理长序列，降低 prefill 显存峰值。
             // position IDs 已在外层一次性算好，chunk 内直接切片，
