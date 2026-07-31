@@ -43,12 +43,14 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         }
 
         let extent = first.extent.size
+        // 应用级像素上限（QwenVL.maxInputPixels）与模型 config 上限取更保守者，
+        // 控制单图 token 预算（默认 ~1200 token）；确定性缩放，不影响前缀对齐。
         let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
             height: Int(extent.height),
             width: Int(extent.width),
             factor: config.patchSize * config.mergeSize,
             minPixels: config.size.minPixels,
-            maxPixels: config.size.maxPixels)
+            maxPixels: min(config.size.maxPixels, QwenVL.maxInputPixels))
 
         let targetSize = CGSize(width: resizedWidth, height: resizedHeight)
 

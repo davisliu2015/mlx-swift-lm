@@ -13,6 +13,12 @@ private func debug(_ message: @autoclosure () -> String) {
 }
 
 public struct QwenVL {
+    /// 应用级单图像素上限（仅 Qwen3VL 图片预处理生效）。默认 ~1.2M px ≈ 1200 token
+    /// （token = 像素 / (patchSize² × mergeSize²) = 像素 / 1024）。宿主应用可注入更保守的
+    /// 上限控制 KV cache 预算；预处理按此上限做确定性 smart_resize，对用户透明。
+    /// nonisolated(unsafe)：仅在模型加载时写入一次，之后推理期只读，无实际竞争。
+    nonisolated(unsafe) public static var maxInputPixels = 1_228_800
+
     /// Rotates half the hidden dims of the input
     static func rotateHalf(_ x: MLXArray) -> MLXArray {
         let index = x.dim(-1) / 2
