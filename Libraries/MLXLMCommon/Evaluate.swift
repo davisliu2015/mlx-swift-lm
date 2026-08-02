@@ -1057,6 +1057,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             processor?.didSample(token: token)
             y = .init(tokens: token)
             eval(y.tokens)
+            // ★ 首 token 入队返回（与 .logits 分支一致）——修复 .tokens 分支首 token
+            // 被 sample/eval 但未 yield 的丢失问题（LLMModel 默认 prepare 恒返回 .tokens，
+            // 纯文本模型 + MTP 必走此分支；smlx 1133cc3 的同款修复）
+            pendingTokens.append(token.item(Int.self))
 
             // Align MTP cache: feed backbone hidden + first sampled token to MTP head
             let _ = model.mtpForward(
