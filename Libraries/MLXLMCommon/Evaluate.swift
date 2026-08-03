@@ -1008,6 +1008,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     private var pendingIndex = 0
     private var pendingDraft: MLXArray?
 
+    // 诊断计数：接受/拒绝次数（迭代器异常结束时随日志输出）
+    private var acceptCount = 0
+    private var rejectCount = 0
+    private var didLogNilDraft = false
+
     public var promptPrefillTime: TimeInterval = 0.0
 
     var lastHiddenStates: MLXArray?
@@ -1110,6 +1115,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
             if verifyId == draftId {
                 // ★ ACCEPT: draft hit
+                acceptCount += 1
                 processor?.didSample(token: draftToken)
                 pendingTokens.append(draftId)
 
@@ -1145,6 +1151,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 return
             } else {
                 // ★ REJECT: draft miss, rollback
+                rejectCount += 1
                 // KV cache rollback 1 position
                 for c in cache where c.isTrimmable {
                     c.trim(1)
@@ -1217,11 +1224,16 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             pendingDraft = draftToken
             // Immediately eval draft token so its computation doesn't block the next backbone step
             eval(draftToken)
+        } else if !didLogNilDraft {
+            // mtpForward 返回 nil（MTP 未启用/权重缺失/cache 异常）——后续每轮都走普通前向
+            didLogNilDraft = true
+            InferenceDebugLog.log("mtp draft: mtpForward returned nil, falling back to normal forward (tokenCount=\(tokenCount))")
         }
     }
 
     mutating public func next() -> Int? {
         if let maxTokens, tokenCount >= maxTokens {
+            InferenceDebugLog.log("mtp-iter end: maxTokens=\(maxTokens) reached tokenCount=\(tokenCount)")
             return nil
         }
 
@@ -1237,6 +1249,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         speculateRound()
 
         if pendingTokens.isEmpty {
+            // ⚠️ 异常退出点：speculateRound 没产出任何 token（draft 生成失败等），
+            // 上层会误判为「取消」。这是「说两个字就停」的重点嫌疑路径。
+            InferenceDebugLog.log("mtp-iter end: speculateRound produced EMPTY pendingTokens tokenCount=\(tokenCount) accepts=\(acceptCount) rejects=\(rejectCount)")
             return nil
         }
 
@@ -2079,6 +2094,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
                 // Check for end-of-sequence tokens
                 if token == tokenizer.unknownTokenId || stopTokenIds.contains(token) {
+                    InferenceDebugLog.log(
+                        "stop-token hit id=\(token) text=\(tokenizer.convertIdToToken(token) ?? "?") isUnk=\(token == tokenizer.unknownTokenId) afterTokens=\(tokenCount)")
                     if includeStopToken {
                         tokenCount += 1
                         if !handler.onStopToken(token, emit: continuation.yield) {
