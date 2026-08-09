@@ -1806,13 +1806,74 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
+    let (stream, _) = try generateTask(
+        input: input, cache: cache, parameters: parameters, context: context,
+        useMTP: useMTP, wiredMemoryTicket: wiredMemoryTicket, tools: tools)
+    return stream
+}
+
+/// A gate that holds a generation task before it starts iterating.
+///
+/// `generateTask(input:...useMTP:)` runs prefill synchronously during iterator
+/// initialization and then starts the background decode task immediately. Callers that
+/// need exclusive cache access between those two moments (e.g. snapshotting the
+/// post-prefill state for cancel/rollback) pass a gate: the background task waits at
+/// the gate without touching the cache until `open()` is called.
+public actor GenerationStartGate {
+    private var isOpen = false
+
+    public init() {}
+
+    /// Wait until the gate is opened. Returns early when the calling task is cancelled,
+    /// so a cancelled generation task still exits through its normal cancellation path
+    /// (no deadlock even if `open()` is never called).
+    public func wait() async {
+        while !isOpen {
+            if Task.isCancelled { return }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+    }
+
+    /// Open the gate, letting any waiting generation task start. Idempotent.
+    public func open() {
+        isOpen = true
+    }
+}
+
+/// MTP variant that also returns the underlying generation task.
+///
+/// The task runs the token iterator (including MTP draft/verify forwards that read and
+/// mutate `cache`) on a separate execution context. Cancellation is cooperative: after
+/// `task.cancel()` the iterator finishes its current step before the loop observes the
+/// cancellation. Awaiting the task's completion therefore guarantees the iterator no
+/// longer touches `cache` — callers that mutate the cache on cancellation (e.g. rolling
+/// it back to a snapshot) must cancel the task and await it first.
+///
+/// - Returns: An `AsyncStream` that emits `Generation` values and the generation `Task`.
+public func generateTask(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    useMTP: Bool,
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [[String: any Sendable]]? = nil,
+    startGate: GenerationStartGate? = nil
+) throws -> (AsyncStream<Generation>, Task<Void, Never>) {
     // Check if the model supports MTP
     guard useMTP, let mtpModel = context.model as? (any MTPCapableModel), mtpModel.hasMTP else {
         // Fall back to standard generation
         if useMTP { print("🚀 [MTP] model does not support MTP, falling back to standard generation") }
-        return try generate(
-            input: input, cache: cache, parameters: parameters, context: context,
-            wiredMemoryTicket: wiredMemoryTicket, tools: tools)
+        let iterator = try TokenIterator(
+            input: input, model: context.model, cache: cache, parameters: parameters)
+        return generateTask(
+            promptTokenCount: input.text.tokens.size,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator,
+            wiredMemoryTicket: wiredMemoryTicket,
+            tools: tools,
+            startGate: startGate)
     }
 
     print("🚀 [MTP] speculative decoding active")
@@ -1822,18 +1883,18 @@ public func generate(
         cache: cache,
         parameters: parameters
     )
-    let (stream, _) = generateLoopTask(
+    return generateLoopTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
+        startGate: startGate,
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
             format: context.configuration.toolCallFormat ?? .json
         )
     )
-    return stream
 }
 
 @available(
@@ -1877,7 +1938,8 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
     tokenizer: Tokenizer,
     iterator: consuming TOKEN,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
-    tools: [[String: any Sendable]]? = nil
+    tools: [[String: any Sendable]]? = nil,
+    startGate: GenerationStartGate? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
         promptTokenCount: promptTokenCount,
@@ -1885,6 +1947,7 @@ public func generateTask<TOKEN: TokenIteratorProtocol>(
         tokenizer: tokenizer,
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
+        startGate: startGate,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
             format: modelConfiguration.toolCallFormat ?? .json,
@@ -2055,6 +2118,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     iterator: consuming any TokenIteratorProtocol,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     includeStopToken: Bool = false,
+    startGate: GenerationStartGate? = nil,
     handler: consuming Handler
 ) -> (AsyncStream<Handler.Output>, Task<Void, Never>) {
 
@@ -2065,6 +2129,9 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
+        // 启动闸门：等待调用方完成 prefill 后的准备工作（如 cache 快照），期间不碰 cache。
+        // 等待中被取消 → wait 提前返回，走下方循环的正常取消收尾，不会死锁。
+        await startGate?.wait()
         let performIteration = {
             let iterator = iterator.consume()
             var handler = handler.consume()
