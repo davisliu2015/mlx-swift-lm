@@ -11,7 +11,7 @@ import MLXNN
 
 // MARK: - Compute G
 
-func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
+public func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
     let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
     return decay
 }
@@ -302,5 +302,32 @@ public func gatedDeltaUpdate(
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
 
+    return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+}
+
+/// 直接吃已算好的 g、beta 的 SSM 状态更新入口（用于方案C变换链折叠）。
+/// 与 gatedDeltaUpdate 等价，但跳过内部的 computeGatedDeltaG/sigmoid，
+/// 便于调用方预先算好 g/beta 并把多层堆到 batch 维、一次 kernel 完成（省 kernel launch）。
+/// state 更新只依赖 g,k,v,beta（不依赖 q），q 可传 k 占位。
+public func gatedDeltaUpdateWithG(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    state: MLXArray? = nil,
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let B = q.dim(0)
+    let Dk = q.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if state.dtype != .float32 {
+        state = state.asType(.float32)
+    }
+    if GatedDeltaKernelManager.shared.kernel != nil {
+        return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    }
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
 }

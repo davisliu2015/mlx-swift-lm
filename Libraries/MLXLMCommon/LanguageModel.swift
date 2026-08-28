@@ -262,9 +262,12 @@ public protocol MTPCapableModel: LanguageModel {
     ///   - tokenIds: token IDs tensor of shape `(1, N)` (the tokens whose embeddings are combined with hidden states)
     ///   - hiddenStates: hidden states from the backbone of shape `(1, N, H)`
     ///   - cache: MTP head KV cache (separate from backbone cache, typically 1 layer)
+    ///   - positionOffset: additional offset added to the computed position id. Used when
+    ///     iteratively generating multiple draft tokens (D2+) from the same backbone hidden
+    ///     without advancing the backbone offset. Defaults to 0 (D1 behavior, unchanged).
     /// - Returns: logits tensor, or `nil` if MTP is not available
     func mtpForward(
-        _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?
+        _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?, positionOffset: Int
     ) -> MLXArray?
 
     /// Optimized MTP forward with cache commit: commits the accepted draft position to the
@@ -295,6 +298,15 @@ public protocol MTPCapableModel: LanguageModel {
     /// without re-running the backbone. The MTP head needs the hidden state
     /// **before** the next token is processed (position t-1), not after.
     var lastForwardHiddenStates: MLXArray? { get }
+
+    /// 方案C（变换链）部分接受恢复：对所有 GatedDeltaNet 层，从 confirmed 后的
+    /// base state 出发，用 `draftOperators[draftIndex]` 折叠出“走完该 draft 后”的
+    /// SSM 状态并写回 cache，免去搬运完整状态快照。返回是否折叠成功。
+    ///
+    /// ⚠️ 必须声明为协议要求（而非仅扩展默认实现），否则通过 `MTPCapableModel`
+    /// 协议类型调用时会静态派发到下方默认实现 `{ false }`，具体模型的真实折叠被绕过。
+    @discardableResult
+    func foldPartialAccept(cache: [KVCache], draftIndex: Int) -> Bool
 }
 
 /// Default implementations for MTPCapableModel.
@@ -303,8 +315,20 @@ extension MTPCapableModel {
         [KVCacheSimple()]
     }
 
+    /// Convenience overload preserving the original signature (D1 callers).
+    /// Forwards with `positionOffset: 0`.
+    public func mtpForward(
+        _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?
+    ) -> MLXArray? {
+        mtpForward(tokenIds, hiddenStates: hiddenStates, cache: cache, positionOffset: 0)
+    }
+
     /// Default: no hidden states available.
     public var lastForwardHiddenStates: MLXArray? { nil }
+
+    /// Default: model has no GatedDeltaNet layers to fold; no-op.
+    @discardableResult
+    public func foldPartialAccept(cache: [KVCache], draftIndex: Int) -> Bool { false }
 
     /// Default fallback: concatenate commit + current and call standard mtpForward.
     /// Models can override this to provide an optimized implementation that skips

@@ -1703,6 +1703,40 @@ public class MambaCache: ArraysCache {
     /// Set by GatedDeltaNet when nConfirmed > 0. On draft rejection, restore this state.
     public var rollbackState: [MLXArray]?
 
+    /// D2+ 阶梯接受用：每个元素是"走完前 i+1 个 draft"后的状态快照 [convState, ssmState]。
+    /// draftSnapshots[0] = 走完 d1 后；draftSnapshots[1] = 走完 d1,d2 后；以此类推。
+    /// 由 GatedDeltaNet 在 nConfirmed>0 的 Chunk2 逐 draft 处理时填充。
+    /// 部分 accept（如 d1✅ d2❌）时，用 rollbackToDraft(0) 精确恢复到"d1 后"。
+    public var draftSnapshots: [[MLXArray]] = []
+
+    /// 方案C（变换链）用：每个元素是第 i 个 draft 的轻量变换算子输入
+    /// [kNormed_i, v_i, a_i, b_i, convSnap_i]（体积 ~几MB，远小于完整 SSM state 快照）。
+    /// 部分 accept 时，从 rollbackState（confirmed 后 base state）出发，
+    /// 用这些算子做一次 gatedDeltaUpdate 折叠出"d1 后"状态，省掉搬运 ~150MB 快照。
+    /// 折叠计算在 GatedDeltaNet 侧完成（那里能访问 gatedDeltaUpdate 与 aLog/dtBias）。
+    public var draftOperators: [[MLXArray]] = []
+
+    /// D2+ 恢复方案选择开关（方案C“真正最优”）。
+    ///
+    /// - `false`（默认）：verify 的 Chunk2 逐 draft 同时存 `draftSnapshots`（方案D，~150MB/份）
+    ///   和 `draftOperators`（方案C，~几MB/份）。partial accept 可任选快照或折叠恢复。
+    /// - `true`：Chunk2 **跳过** `draftSnapshots`，只存轻量 `draftOperators`，
+    ///   省下 decode 阶段宝贵的内存带宽；partial accept 必须走变换链折叠恢复。
+    ///
+    /// ## 归属与热更新
+    /// 该开关放在 `MambaCache` 实例上（而非全局 static），原因：
+    /// 1. “要不要存快照”这个动作就发生在 GatedDeltaNet 写本 cache 时，语义最贴切；
+    /// 2. 无全局状态、天然并发安全（每个会话/请求各自的 cache 互不干扰）；
+    /// 3. **支持热更新**：运行中随时修改本属性，**下一轮 verify 的 Chunk2 立即生效**
+    ///    （每轮都会重新读它决定存不存），无需重建 cache、无需重启生成。
+    ///
+    /// smlx 侧把它作为用户可配置项：`newCache(...)` 后遍历所有 `MambaCache` 设置本值；
+    /// 用户在设置里改动时，同样遍历当前存活的 cache 更新即可，当前生成会话平滑切换。
+    ///
+    /// 注意：调用方在 partial accept 恢复时应据本值选择恢复路径
+    /// （`true` → 变换链折叠；`false` → 可用快照 `rollbackToDraft`），避免热切后取用了未存的快照。
+    public var foldOnly: Bool = false
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
     }
@@ -1714,7 +1748,31 @@ public class MambaCache: ArraysCache {
         guard let saved = rollbackState else { return false }
         self.state = saved
         rollbackState = nil
+        draftSnapshots = []
+        draftOperators = []
         return true
+    }
+
+    /// 阶梯接受：恢复到"走完前 i+1 个 draft"的状态（draftSnapshots[i]）。
+    /// 例如 rollbackToDraft(0) 恢复到"d1 后"。恢复后清空所有快照。
+    /// 返回是否成功。
+    @discardableResult
+    public func rollbackToDraft(_ i: Int) -> Bool {
+        guard i >= 0, i < draftSnapshots.count else { return false }
+        self.state = draftSnapshots[i]
+        rollbackState = nil
+        draftSnapshots = []
+        draftOperators = []
+        return true
+    }
+
+    /// 方案C：把当前 state 直接设为给定的折叠结果（由 GatedDeltaNet 折叠算出），
+    /// 并清空所有中间存储。用于部分 accept 时用变换链恢复"d1 后"状态。
+    public func applyFolded(_ folded: [MLXArray]) {
+        self.state = folded
+        rollbackState = nil
+        draftSnapshots = []
+        draftOperators = []
     }
 
     public override func copy() -> any KVCache {
@@ -1728,6 +1786,9 @@ public class MambaCache: ArraysCache {
         if let rb = rollbackState {
             new.rollbackState = rb.map { $0[.ellipsis] }
         }
+        new.draftSnapshots = draftSnapshots.map { snap in snap.map { $0[.ellipsis] } }
+        new.draftOperators = draftOperators.map { op in op.map { $0[.ellipsis] } }
+        new.foldOnly = self.foldOnly
         return new
     }
 }

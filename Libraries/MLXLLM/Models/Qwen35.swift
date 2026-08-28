@@ -300,7 +300,8 @@ final class Qwen35GatedDeltaNet: Module {
             )
             outC = norm(outC, gate: zC)
 
-            // ★ Save rollback snapshot: state after confirmed tokens ★
+            // ★ Save rollback snapshot: state after confirmed tokens (S_confirmed) ★
+            // reject 时 rollback() 用；也是方案C折叠的 base state。
             if let cache {
                 var snapshotState = [MLXArray]()
                 snapshotState.append(convStateC[.ellipsis])  // deep copy
@@ -308,9 +309,16 @@ final class Qwen35GatedDeltaNet: Module {
                     snapshotState.append(s[.ellipsis])
                 }
                 cache.rollbackState = snapshotState
+                // 新一轮 verify 开始，清空上一轮的 draft 中间存储
+                cache.draftSnapshots = []
+                cache.draftOperators = []
             }
 
             // --- Chunk 2: Draft tokens ---
+            // D2+ 阶梯接受支持：逐 draft 处理 SSM 更新，在每个 draft 之后存一份中间状态，
+            // 供 partial accept（如 d1✅ d2❌ 恢复到"d1 后"）。卷积部分仍一次算完
+            // （输出与原实现一致），仅额外按位置切出每个 draft 后的 convState。
+            // 详见 Libraries/MLXVLM/Models/Qwen35_MTP_D2.md。
             let nDraft = S - nConfirmed
             let qkvD = qkv[0..., nConfirmed..., 0...]
             let bD = b[0..., nConfirmed..., 0...]
@@ -336,15 +344,47 @@ final class Qwen35GatedDeltaNet: Module {
                 * MLXFast.rmsNorm(kD, weight: MLXArray.mlxNone, eps: 1e-6)
 
             var stateD = stateC
-            var outD: MLXArray
-            (outD, stateD) = gatedDeltaUpdate(
-                q: qNormedD, k: kNormedD, v: vD,
-                a: aD, b: bD, aLog: aLog, dtBias: dtBias,
-                state: stateD, mask: maskD
-            )
+            var outParts = [MLXArray]()
+            let kw = convKernelSize - 1
+            // 逐 draft 做 SSM 更新并存中间态（快照 D + 算子 C）
+            for i in 0 ..< nDraft {
+                let qi = qNormedD[0..., i ..< (i + 1), 0..., 0...]
+                let ki = kNormedD[0..., i ..< (i + 1), 0..., 0...]
+                let vi = vD[0..., i ..< (i + 1), 0..., 0...]
+                let ai = aD[0..., i ..< (i + 1), 0...]
+                let bi = bD[0..., i ..< (i + 1), 0...]
+                let maski = maskD?[0..., i ..< (i + 1)]
+
+                var outi: MLXArray
+                (outi, stateD) = gatedDeltaUpdate(
+                    q: qi, k: ki, v: vi,
+                    a: ai, b: bi, aLog: aLog, dtBias: dtBias,
+                    state: stateD, mask: maski
+                )
+                outParts.append(outi)
+
+                // 该 draft 后的 convState：convInputD 中截止到该 draft 的最后 kw 个位置。
+                let convEnd = kw + i + 1
+                let convSnap = convInputD[0..., (convEnd - kw) ..< convEnd]
+
+                if let cache, let st = stateD {
+                    // 方案D：完整状态快照（~150MB/份）。cache.foldOnly 时跳过以省带宽。
+                    if !cache.foldOnly {
+                        cache.draftSnapshots.append([convSnap[.ellipsis], st[.ellipsis]])
+                    }
+                    // 方案C：轻量变换算子（存已算好的 g、beta，便于跨层堆 batch 维一次折叠）。
+                    let gi = computeGatedDeltaG(aLog, ai, dtBias)
+                    let betai = sigmoid(bi).asType(.float32)
+                    cache.draftOperators.append([
+                        ki[.ellipsis], vi[.ellipsis], gi[.ellipsis], betai[.ellipsis],
+                        convSnap[.ellipsis],
+                    ])
+                }
+            }
+            var outD = concatenated(outParts, axis: 1)
             outD = norm(outD, gate: zD)
 
-            // Update cache to final state (includes draft tokens)
+            // Update cache to final state (includes all draft tokens = S_d2)
             if let cache {
                 cache[0] = convStateD
                 cache[1] = stateD
@@ -715,8 +755,11 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, MTPCap
     }
 
     /// Get MTP draft logits given hidden states and token IDs
-    public func mtpForward(_ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?) -> MLXArray? {
+    public func mtpForward(_ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?, positionOffset: Int) -> MLXArray? {
         guard let mtp else { return nil }
+        // positionOffset: LLM 版位置由 cache offset 隐式决定，无显式 positionIds，
+        // 此参数保留以满足 MTPCapableModel 协议一致性（当前不生效）。
+        _ = positionOffset
 
         let tokenEmb = model.embedTokens(tokenIds)
         let eNormed = mtp.eNorm(tokenEmb)
@@ -789,6 +832,58 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, MTPCap
         } else {
             return model.embedTokens.asLinear(x)
         }
+    }
+
+    /// 方案C（变换链）部分接受恢复：对所有 GatedDeltaNet 层，从 rollbackState
+    /// （confirmed 后 base state）出发，用 draftOperators[draftIndex] 折叠出
+    /// “走完该 draft 后”的状态并写回 cache，免去搬运完整状态快照。
+    /// 仅处理 linearAttn 层；full-attention 层无 SSM state，跳过。
+    ///
+    /// 优化点1：把所有 DeltaNet 层的 (k,v,g,beta,state) 堆叠到 batch 维，
+    /// 一次 gatedDeltaUpdateWithG 调用完成全部折叠（避免逐层多次 kernel launch）。
+    /// 详见 Libraries/MLXVLM/Models/Qwen35_MTP_D2.md。返回是否折叠成功。
+    @discardableResult
+    public func foldPartialAccept(cache: [KVCache], draftIndex: Int) -> Bool {
+        let layers = model.layers
+        var mcs = [MambaCache]()
+        var ks = [MLXArray]()
+        var vs = [MLXArray]()
+        var gs = [MLXArray]()
+        var betas = [MLXArray]()
+        var states = [MLXArray]()
+        var convSnaps = [MLXArray]()
+        for (i, layer) in layers.enumerated() {
+            guard layer.linearAttn != nil else { continue }
+            guard i < cache.count, let mc = cache[i] as? MambaCache else { continue }
+            guard draftIndex < mc.draftOperators.count else { continue }
+            guard let rb = mc.rollbackState, rb.count >= 2 else { continue }
+            let op = mc.draftOperators[draftIndex]  // [k, v, g, beta, convSnap]
+            mcs.append(mc)
+            ks.append(op[0])
+            vs.append(op[1])
+            gs.append(op[2])
+            betas.append(op[3])
+            convSnaps.append(op[4])
+            states.append(rb[1])  // base SSM state (confirmed 后)
+        }
+        guard !mcs.isEmpty else { return false }
+
+        // 堆叠到 batch 维，一次 kernel 完成全部层折叠（q 传 k 占位，不影响 state 更新）
+        let kAll = concatenated(ks, axis: 0)
+        let vAll = concatenated(vs, axis: 0)
+        let gAll = concatenated(gs, axis: 0)
+        let betaAll = concatenated(betas, axis: 0)
+        let stateAll = concatenated(states, axis: 0)
+
+        let (_, foldedAll) = gatedDeltaUpdateWithG(
+            q: kAll, k: kAll, v: vAll, g: gAll, beta: betaAll, state: stateAll, mask: nil)
+        eval(foldedAll)
+
+        for (idx, mc) in mcs.enumerated() {
+            let st = foldedAll[idx ..< (idx + 1)]  // [1,Hv,Dv,Dk]
+            mc.applyFolded([convSnaps[idx], st])
+        }
+        return true
     }
 
     /// Hybrid 模型（16 层 full-attn + 48 层 GatedDeltaNet）。
@@ -941,9 +1036,16 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider, MTPCapable
     }
 
     public func mtpForward(
-        _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?
+        _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?, positionOffset: Int
     ) -> MLXArray? {
-        languageModel.mtpForward(tokenIds, hiddenStates: hiddenStates, cache: cache)
+        languageModel.mtpForward(
+            tokenIds, hiddenStates: hiddenStates, cache: cache, positionOffset: positionOffset)
+    }
+
+    /// 方案C 变换链部分接受恢复（转发到 languageModel）。详见 Qwen35_MTP_D2.md。
+    @discardableResult
+    public func foldPartialAccept(cache: [KVCache], draftIndex: Int) -> Bool {
+        languageModel.foldPartialAccept(cache: cache, draftIndex: draftIndex)
     }
 
     public func mtpForwardWithCommit(

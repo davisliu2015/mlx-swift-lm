@@ -587,9 +587,16 @@ enum Qwen35Language {
                         snapshotState.append(s[.ellipsis])
                     }
                     cache.rollbackState = snapshotState
+                    // 新一轮 verify 开始，清空上一轮的 draft 中间存储
+                    cache.draftSnapshots = []
+                    cache.draftOperators = []
                 }
 
                 // --- Chunk 2: Draft tokens ---
+                // 逐 draft 处理 SSM 更新，在每个 draft 之后保存一份中间快照，
+                // 供 D2+ 阶梯接受（如 d1✅ d2❌ 时恢复到"d1 后"）。
+                // 注意：卷积部分仍一次性算完（卷积输出与原实现完全一致），
+                // 仅额外按位置切出每个 draft 后的 convState；SSM 的 gatedDeltaUpdate 拆成逐 draft。
                 let nDraft = S - nConfirmed
                 let qkvD = mixedQKV[0..., nConfirmed..., 0...]
                 let bD = b[0..., nConfirmed..., 0...]
@@ -615,12 +622,50 @@ enum Qwen35Language {
                     * MLXFast.rmsNorm(kD, weight: MLXArray.mlxNone, eps: 1e-6)
 
                 var stateD = stateC
-                var outD: MLXArray
-                (outD, stateD) = gatedDeltaUpdate(
-                    q: qNormedD, k: kNormedD, v: vD,
-                    a: aD, b: bD, aLog: aLog, dtBias: dtBias,
-                    state: stateD, mask: maskD
-                )
+                var outParts = [MLXArray]()
+                let kw = convKernelSize - 1
+                // 逐 draft 做 SSM 更新并存快照
+                for i in 0..<nDraft {
+                    let qi = qNormedD[0..., i..<(i + 1), 0..., 0...]
+                    let ki = kNormedD[0..., i..<(i + 1), 0..., 0...]
+                    let vi = vD[0..., i..<(i + 1), 0..., 0...]
+                    let ai = aD[0..., i..<(i + 1), 0...]
+                    let bi = bD[0..., i..<(i + 1), 0...]
+                    let maski = maskD?[0..., i..<(i + 1)]
+
+                    var outi: MLXArray
+                    (outi, stateD) = gatedDeltaUpdate(
+                        q: qi, k: ki, v: vi,
+                        a: ai, b: bi, aLog: aLog, dtBias: dtBias,
+                        state: stateD, mask: maski
+                    )
+                    outParts.append(outi)
+
+                    // 该 draft 后的 convState = convInputD 中截止到该 draft 的最后 kw 个位置。
+                    // convInputD 前 kw 个是 convStateC，之后是 draft 的 qkv，
+                    // 所以走完第 i 个 draft（0-based）时，末尾窗口是 [i+1, i+1+kw)。
+                    let convEnd = kw + i + 1
+                    let convSnap = convInputD[0..., (convEnd - kw)..<convEnd]
+
+                    if let cache, let st = stateD {
+                        // 方案D：存完整状态快照（~150MB/份）。
+                        // cache.foldOnly（方案C真正最优）下跳过，节省 decode 内存带宽。
+                        // 该开关是 MambaCache 实例属性，支持运行中热更新（下一轮 verify 生效）。
+                        if !cache.foldOnly {
+                            cache.draftSnapshots.append([convSnap[.ellipsis], st[.ellipsis]])
+                        }
+                        // 方案C：存轻量变换算子（~几MB/份），供 reject 时折叠重算。
+                        // 存已算好的 g、beta（而非原始 a、b + 每层 aLog/dtBias），
+                        // 这样跨层折叠时可直接 stack 到 batch 维、一次 kernel 完成（优化点1）。
+                        let gi = computeGatedDeltaG(aLog, ai, dtBias)
+                        let betai = sigmoid(bi).asType(.float32)
+                        cache.draftOperators.append([
+                            ki[.ellipsis], vi[.ellipsis], gi[.ellipsis], betai[.ellipsis],
+                            convSnap[.ellipsis],
+                        ])
+                    }
+                }
+                var outD = concatenated(outParts, axis: 1)
                 outD = norm(outD, gate: zD)
 
                 if let cache {
@@ -1210,6 +1255,61 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
     /// Whether MTP speculative decoding is available for this VLM
     public var hasMTP: Bool { languageModel.hasMTP }
 
+    /// 方案C（变换链）部分接受恢复：对所有 GatedDeltaNet 层，从 rollbackState
+    /// （confirmed 后 base state）出发，用 draftOperators[draftIndex] 折叠出
+    /// "走完该 draft 后"的状态并写回 cache，免去搬运完整状态快照。
+    /// 仅处理 linearAttn 层；full-attention 层无 SSM state，跳过。
+    ///
+    /// 优化点1：把所有 DeltaNet 层的 (k,v,g,beta,state) 堆叠到 batch 维，
+    /// 一次 gatedDeltaUpdateWithG 调用完成全部 48 层折叠（原来是逐层 48 次 kernel launch）。
+    /// 返回是否折叠成功。
+    @discardableResult
+    public func foldPartialAccept(cache: [KVCache], draftIndex: Int) -> Bool {
+        let layers = languageModel.model.layers
+        // 收集所有可折叠的 DeltaNet 层
+        var mcs = [MambaCache]()
+        var ks = [MLXArray]()
+        var vs = [MLXArray]()
+        var gs = [MLXArray]()
+        var betas = [MLXArray]()
+        var states = [MLXArray]()
+        var convSnaps = [MLXArray]()
+        for (i, layer) in layers.enumerated() {
+            guard layer.linearAttn != nil else { continue }
+            guard i < cache.count, let mc = cache[i] as? MambaCache else { continue }
+            guard draftIndex < mc.draftOperators.count else { continue }
+            guard let rb = mc.rollbackState, rb.count >= 2 else { continue }
+            let op = mc.draftOperators[draftIndex]  // [k, v, g, beta, convSnap]
+            mcs.append(mc)
+            ks.append(op[0])
+            vs.append(op[1])
+            gs.append(op[2])
+            betas.append(op[3])
+            convSnaps.append(op[4])
+            states.append(rb[1])  // base SSM state (confirmed 后)
+        }
+        guard !mcs.isEmpty else { return false }
+
+        // 堆叠到 batch 维：state [1,Hv,Dv,Dk]→[L,Hv,Dv,Dk]，k/v/g/beta 同理沿 axis0
+        let kAll = concatenated(ks, axis: 0)
+        let vAll = concatenated(vs, axis: 0)
+        let gAll = concatenated(gs, axis: 0)
+        let betaAll = concatenated(betas, axis: 0)
+        let stateAll = concatenated(states, axis: 0)
+
+        // 一次 kernel 完成全部层的 SSM 折叠（q 传 k 占位，不影响 state）
+        let (_, foldedAll) = gatedDeltaUpdateWithG(
+            q: kAll, k: kAll, v: vAll, g: gAll, beta: betaAll, state: stateAll, mask: nil)
+        eval(foldedAll)
+
+        // 切回各层并写入 cache
+        for (idx, mc) in mcs.enumerated() {
+            let st = foldedAll[idx..<(idx + 1)]  // [1,Hv,Dv,Dk]
+            mc.applyFolded([convSnaps[idx], st])
+        }
+        return true
+    }
+
     /// MTP 权重在 sanitize 中被捕获，模型加载后需手动注入
     nonisolated(unsafe) private static var pendingMTPWeights: [String: MLXArray] = [:]
 
@@ -1669,7 +1769,7 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
     }
 
     public func mtpForward(
-        _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?
+        _ tokenIds: MLXArray, hiddenStates: MLXArray, cache: [KVCache]?, positionOffset: Int
     ) -> MLXArray? {
             // 从主模型 cache 动态读取 position（rejection trim 后也能拿到正确值）
             let mtpPosition: Int
@@ -1681,9 +1781,11 @@ public class Qwen35: Module, VLMModel, MTPCapableModel {
             }
 
             // MTP 处理的 hidden states 来自主模型位置 [mtpPosition-L, ..., mtpPosition-1]
+            // positionOffset: D2+ 迭代生成多个 draft 时，backbone offset 未推进，
+            // 需手动 +i 让第 i 个 draft 的 position 正确对齐（D1 默认 0，行为不变）。
             let L = tokenIds.dim(1)
             let B = tokenIds.dim(0)
-            let startPos = mtpPosition - L
+            let startPos = mtpPosition - L + positionOffset
 
             var delta = MLXArray(Int32(startPos)).asType(.int32)
             if let ropeDeltas = _mtpState?[ropeDeltasKey] {
