@@ -1013,12 +1013,34 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     private var rejectCount = 0
     private var didLogNilDraft = false
 
+    // D2 诊断计数
+    private var d2FullAccept = 0
+    private var d2PartialAccept = 0
+    private var d2Reject = 0
+    private var d2D1Hit = 0
+    private var d2D2Hit = 0
+
     public var promptPrefillTime: TimeInterval = 0.0
 
     var lastHiddenStates: MLXArray?
 
     // For cache_commit on accept: carry the accepted draft's hidden + token to align MTP cache
     private var pendingCacheCommit: (hidden: MLXArray, token: MLXArray)?
+
+    /// Number of draft tokens generated & verified per round.
+    /// `1` → D1 (single-draft, original behavior). `2` → D2 (two drafts + partial accept).
+    let mtpDepth: Int
+
+    /// DeltaNet rollback strategy for D2 partial-accept:
+    /// `true` = Recompute (fold transform chain, saves memory bandwidth),
+    /// `false` = Snapshot (O(1) state copy, faster restore but more bandwidth).
+    /// Only consulted on the D2 partial-accept path. Also mirrored onto each
+    /// `MambaCache.foldOnly` at init so the cache records only what the chosen path needs.
+    let foldOnly: Bool
+
+    /// EOS token ids; D2 path checks these to stop mid-round (D1 path relies on the
+    /// outer generate loop's EOS handling, kept unchanged).
+    private let eosTokenIds: Set<Int>
 
     /// Initialize a `MTPSpeculativeTokenIterator` with the given input.
     ///
@@ -1027,11 +1049,18 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     ///   - model: a model conforming to ``MTPCapableModel``
     ///   - cache: optional ``KVCache`` for the backbone model
     ///   - parameters: the generation parameters
+    ///   - mtpDepth: number of draft tokens per round; `1` = D1 (default), `2` = D2.
+    ///   - foldOnly: D2 partial-accept rollback strategy (`true` = Recompute/fold,
+    ///     `false` = Snapshot). Ignored for D1.
+    ///   - eosTokenIds: EOS ids used by the D2 path to stop mid-round.
     public init(
         input: LMInput,
         model: any MTPCapableModel,
         cache: [KVCache]? = nil,
-        parameters: GenerateParameters
+        parameters: GenerateParameters,
+        mtpDepth: Int = 1,
+        foldOnly: Bool = false,
+        eosTokenIds: Set<Int> = []
     ) throws {
         self.model = model
         self.y = input.text
@@ -1040,6 +1069,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         self.sampler = parameters.sampler()
         self.processor = parameters.processor()
         self.maxTokens = parameters.maxTokens
+        self.mtpDepth = Swift.max(1, mtpDepth)
+        self.foldOnly = foldOnly
+        self.eosTokenIds = eosTokenIds
+
+        // D2 records draft operators (Recompute) or full snapshots (Snapshot) on each
+        // MambaCache; set the flag so the cache stores only what the chosen path needs.
+        if self.mtpDepth >= 2 {
+            for c in self.cache { (c as? MambaCache)?.foldOnly = foldOnly }
+        }
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
@@ -1067,9 +1105,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             // 纯文本模型 + MTP 必走此分支；smlx 1133cc3 的同款修复）
             pendingTokens.append(token.item(Int.self))
 
+            // D2 needs single-position hidden (1,1,H) for the concat-based draft path.
+            if mtpDepth >= 2 {
+                let seqLen = hidden.dim(1)
+                lastHiddenStates = hidden[0..., (seqLen - 1)..., 0...]
+            }
+
             // Align MTP cache: feed backbone hidden + first sampled token to MTP head
             let _ = model.mtpForward(
-                y.tokens[.newAxis], hiddenStates: hidden, cache: mtpCache)
+                y.tokens[.newAxis], hiddenStates: lastHiddenStates!, cache: mtpCache)
 
         case .logits(let result):
             var logits = result.logits[0..., -1, 0...]
@@ -1086,9 +1130,18 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 let seqLen = allHidden.dim(1)
                 lastHiddenStates = allHidden[0..., (seqLen - 1)..., 0...]
             }
+
+            // D2 skips generateDraft below, so align the MTP cache here (feed backbone
+            // hidden + first sampled token). D1 aligns inside generateDraft's first call.
+            if mtpDepth >= 2, let h = lastHiddenStates {
+                let _ = model.mtpForward(y.tokens[.newAxis], hiddenStates: h, cache: mtpCache)
+            }
         }
 
-        generateDraft(cacheCommit: nil)
+        // D1 primes the first draft here; D2 generates drafts inside speculateRoundD2().
+        if mtpDepth < 2 {
+            generateDraft(cacheCommit: nil)
+        }
     }
 
     mutating func speculateRound() {
@@ -1192,6 +1245,158 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         generateDraft(cacheCommit: nil)
     }
 
+    /// D2 draft-logits helper: run the MTP head once at `positionOffset` and return
+    /// the last-position logits. Mirrors test_mtp_v2's `mtpDraftLogits`.
+    /// Caller has verified `hasMTP`, so `mtpForward` returns non-nil.
+    private func mtpDraftLogits(token: MLXArray, hidden: MLXArray, positionOffset: Int) -> MLXArray? {
+        guard let logits = model.mtpForward(
+            token[.newAxis], hiddenStates: hidden, cache: mtpCache,
+            positionOffset: positionOffset)
+        else { return nil }
+        return logits[0..., -1, 0...]
+    }
+
+    /// D2 speculation round: generate 2 draft tokens, verify with a single backbone
+    /// forward over [confirmed, d1, d2], and handle full-accept / partial-accept / reject.
+    ///
+    /// Ported from the validated `test_mtp_v2` D2 driver. Emitted tokens are appended to
+    /// `pendingTokens`; EOS stops appending further tokens this round (the outer generate
+    /// loop performs the actual EOS-based stop). Partial-accept uses `foldOnly` to pick
+    /// Recompute (fold transform chain) vs Snapshot (O(1) state copy).
+    mutating func speculateRoundD2() {
+        guard let hidden0 = lastHiddenStates else { return }
+
+        func emitStop(_ id: Int) -> Bool {
+            pendingTokens.append(id)
+            return eosTokenIds.contains(id)
+        }
+
+        // 1) Generate 2 drafts via MTP head (iterate twice with positionOffset 0 then 1).
+        guard let l1 = mtpDraftLogits(token: y.tokens, hidden: hidden0, positionOffset: 0) else {
+            if !didLogNilDraft {
+                didLogNilDraft = true
+                InferenceDebugLog.log("mtp-D2 draft: mtpForward returned nil at d1 (tokenCount=\(tokenCount))")
+            }
+            return
+        }
+        let d1 = sampler.sample(logits: processor?.process(logits: l1) ?? l1)
+        eval(d1)
+        guard let l2 = mtpDraftLogits(token: d1, hidden: hidden0, positionOffset: 1) else {
+            if !didLogNilDraft {
+                didLogNilDraft = true
+                InferenceDebugLog.log("mtp-D2 draft: mtpForward returned nil at d2 (tokenCount=\(tokenCount))")
+            }
+            return
+        }
+        let d2 = sampler.sample(logits: processor?.process(logits: l2) ?? l2)
+        eval(d2)
+
+        // 2) Verify: backbone consumes [confirmed(y), d1, d2], nConfirmed=1.
+        let verifyInput = MLX.concatenated([y.tokens, d1, d2])[.newAxis]
+        let (vLogits, vHidden) = model.forwardWithHiddenStates(
+            verifyInput, cache: cache, nConfirmed: 1)
+
+        // position 0 (confirmed) → verifyToken0 (validates d1)
+        var logits0 = vLogits[0..., 0, 0...]
+        logits0 = processor?.process(logits: logits0) ?? logits0
+        let vTok0 = sampler.sample(logits: logits0)
+        eval(vTok0, d1, d2)
+        let vId0 = vTok0.item(Int.self)
+        let d1Id = d1.item(Int.self)
+
+        let d1ok = (vId0 == d1Id)
+        var d2ok = false
+        var vTok1: MLXArray? = nil
+        if d1ok {
+            var logits1 = vLogits[0..., 1, 0...]
+            logits1 = processor?.process(logits: logits1) ?? logits1
+            let t1 = sampler.sample(logits: logits1)
+            eval(t1)
+            vTok1 = t1
+            d2ok = (t1.item(Int.self) == d2.item(Int.self))
+            d2D1Hit += 1
+            if d2ok { d2D2Hit += 1 }
+        }
+
+        if d1ok && d2ok {
+            // ★ full accept: emit d1 + d2 + bonus(position 2)
+            d2FullAccept += 1
+            var logits2 = vLogits[0..., 2, 0...]
+            logits2 = processor?.process(logits: logits2) ?? logits2
+            let bonus = sampler.sample(logits: logits2)
+            eval(bonus)
+            let d1v = d1.item(Int.self)
+            let d2v = d2.item(Int.self)
+            let bv = bonus.item(Int.self)
+            processor?.didSample(token: d1)
+            if emitStop(d1v) { return }
+            processor?.didSample(token: d2)
+            if emitStop(d2v) { return }
+            processor?.didSample(token: bonus)
+            if emitStop(bv) { return }
+            // advance: clear rollback snapshots and all draft intermediate storage
+            for c in cache {
+                if let mc = c as? MambaCache {
+                    mc.rollbackState = nil
+                    mc.draftSnapshots = []
+                    mc.draftOperators = []
+                }
+            }
+            y = .init(tokens: bonus)
+            lastHiddenStates = vHidden[0..., 2...2, 0...]
+            let _ = model.mtpForward(y.tokens[.newAxis], hiddenStates: lastHiddenStates!, cache: mtpCache)
+        } else if d1ok {
+            // ★ partial accept (d1 ✅ d2 ❌): accept d1, discard d2.
+            d2PartialAccept += 1
+            // backbone KV: verify wrote d1, d2; keep d1 → trim 1
+            for c in cache where c.isTrimmable { c.trim(1) }
+
+            if foldOnly {
+                // Recompute: fold transform chain (library evals internally)
+                model.foldPartialAccept(cache: cache, draftIndex: 0)
+            } else {
+                // Snapshot: O(1) state copy restore; MLX is lazy so eval to force the copy.
+                for c in cache { (c as? MambaCache)?.rollbackToDraft(0) }
+                for c in cache {
+                    if let mc = c as? MambaCache, mc.state.count >= 2 {
+                        eval(mc.state[1])
+                    }
+                }
+            }
+            // mtpCache: this round wrote d1, d2; keep d1 → trim 1
+            for c in mtpCache where c.isTrimmable { c.trim(1) }
+
+            let d1v = d1.item(Int.self)
+            processor?.didSample(token: d1)
+            if emitStop(d1v) { return }
+
+            // next confirmed = the real prediction after d1 (reuse verify position 1)
+            let nextTok = vTok1!
+            y = .init(tokens: nextTok)
+            lastHiddenStates = vHidden[0..., 1...1, 0...]
+            let _ = model.mtpForward(y.tokens[.newAxis], hiddenStates: lastHiddenStates!, cache: mtpCache)
+            processor?.didSample(token: nextTok)
+            let ntv = nextTok.item(Int.self)
+            if emitStop(ntv) { return }
+        } else {
+            // ★ reject (d1 miss): discard d1/d2, keep verifyToken0.
+            d2Reject += 1
+            // backbone KV: verify wrote d1, d2 extra positions → trim 2
+            for c in cache where c.isTrimmable { c.trim(2) }
+            // MambaCache SSM state rollback to post-confirmed snapshot
+            for c in cache { (c as? MambaCache)?.rollback() }
+            // mtpCache: this round's MTP head wrote d1, d2 → trim 2
+            for c in mtpCache where c.isTrimmable { c.trim(2) }
+
+            let v0 = vId0
+            processor?.didSample(token: vTok0)
+            if emitStop(v0) { return }
+            y = .init(tokens: vTok0)
+            lastHiddenStates = vHidden[0..., 0...0, 0...]
+            let _ = model.mtpForward(y.tokens[.newAxis], hiddenStates: lastHiddenStates!, cache: mtpCache)
+        }
+    }
+
     /// Use MTP head to generate 1 draft token.
     ///
     /// - Parameter cacheCommit: When the previous draft was accepted, the accepted draft's
@@ -1246,7 +1451,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         pendingTokens.removeAll(keepingCapacity: true)
         pendingIndex = 0
-        speculateRound()
+        if mtpDepth >= 2 {
+            speculateRoundD2()
+        } else {
+            speculateRound()
+        }
 
         if pendingTokens.isEmpty {
             // ⚠️ 异常退出点：speculateRound 没产出任何 token（draft 生成失败等），
@@ -1803,12 +2012,15 @@ public func generate(
     parameters: GenerateParameters,
     context: ModelContext,
     useMTP: Bool,
+    mtpDepth: Int = 1,
+    foldOnly: Bool = false,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
     let (stream, _) = try generateTask(
         input: input, cache: cache, parameters: parameters, context: context,
-        useMTP: useMTP, wiredMemoryTicket: wiredMemoryTicket, tools: tools)
+        useMTP: useMTP, mtpDepth: mtpDepth, foldOnly: foldOnly,
+        wiredMemoryTicket: wiredMemoryTicket, tools: tools)
     return stream
 }
 
@@ -1856,6 +2068,8 @@ public func generateTask(
     parameters: GenerateParameters,
     context: ModelContext,
     useMTP: Bool,
+    mtpDepth: Int = 1,
+    foldOnly: Bool = false,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil,
     startGate: GenerationStartGate? = nil
@@ -1876,12 +2090,15 @@ public func generateTask(
             startGate: startGate)
     }
 
-    print("🚀 [MTP] speculative decoding active")
+    print("🚀 [MTP] speculative decoding active (D\(max(1, mtpDepth))\(mtpDepth >= 2 ? (foldOnly ? ", recompute" : ", snapshot") : ""))")
     let iterator = try MTPSpeculativeTokenIterator(
         input: input,
         model: mtpModel,
         cache: cache,
-        parameters: parameters
+        parameters: parameters,
+        mtpDepth: mtpDepth,
+        foldOnly: foldOnly,
+        eosTokenIds: context.configuration.eosTokenIds
     )
     return generateLoopTask(
         promptTokenCount: input.text.tokens.size,
