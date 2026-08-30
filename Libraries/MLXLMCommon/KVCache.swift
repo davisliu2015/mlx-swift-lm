@@ -1302,20 +1302,23 @@ func applyMRoPEShift(
 ///   with YaRN / LongRoPE models (see ``applyUniformRoPEShift(_:delta:dimensions:traditional:base:scale:)``).
 public class StreamingKVCache: KVCacheSimple {
     /// Number of leading "attention sink" tokens that are always retained and never re-rotated.
-    public private(set) var keep: Int
+    /// NOTE: setter is `internal` so QuantizedStreamingKVCache can restore it from metaState.
+    public internal(set) var keep: Int
     /// Maximum number of non-sink (sliding window) tokens retained after eviction.
-    public private(set) var windowSize: Int
+    public internal(set) var windowSize: Int
 
     // RoPE parameters needed to re-index survivors. Must match the model's RoPE.
-    private var ropeDimensions: Int
-    private var ropeBase: Float
-    private var ropeTraditional: Bool
-    private var ropeScale: Float
+    // NOTE: `internal` (not `private`) so the quantized subclass QuantizedStreamingKVCache
+    // can reuse them in its own evict() implementation.
+    internal var ropeDimensions: Int
+    internal var ropeBase: Float
+    internal var ropeTraditional: Bool
+    internal var ropeScale: Float
 
     // M-RoPE support (for VLM models like Qwen3.5/3.6).
     // When non-nil, evict() applies segmented RoPE shift per position component.
     // e.g. [11, 11, 10] for Qwen3.5: 11 text freq pairs, 11 height, 10 width.
-    private var mropeSection: [Int]?
+    internal var mropeSection: [Int]?
 
     /// Per-position flag: `imageTokenMask[pos] == true` → position `pos` is an image visual token.
     /// Image tokens need a different RoPE shift than text tokens during eviction
@@ -1375,6 +1378,19 @@ public class StreamingKVCache: KVCacheSimple {
             imageTokenMask[startOffset + i] = mask[i]
         }
     }
+
+    /// Copy the image-token mask from another StreamingKVCache (used when building a
+    /// quantized variant or a copy). Internal helper — `imageTokenMask` is otherwise private.
+    internal func adoptImageMask(from other: StreamingKVCache) {
+        self.imageTokenMask = other.imageTokenMask
+    }
+
+    /// Alias used by the temporary self-check path (kept separate so it is easy to grep+delete).
+    // ⚠️⚠️⚠️ TEMP-KVQUANT-SELFCHECK BEGIN —— 验证通过后必须整段删除 ⚠️⚠️⚠️
+    internal func adoptImageMaskForSelfCheck(from other: StreamingKVCache) {
+        self.imageTokenMask = other.imageTokenMask
+    }
+    // ⚠️⚠️⚠️ TEMP-KVQUANT-SELFCHECK END ⚠️⚠️⚠️
 
     /// Whether the cache currently holds more valid tokens than `capacity`.
     public var needsEviction: Bool { offset > capacity }
@@ -1567,6 +1583,236 @@ public class StreamingKVCache: KVCacheSimple {
             self.ropeScale = Float(newValue[5]) ?? 1.0
         }
     }
+}
+
+/// Quantized variant of ``StreamingKVCache``.
+///
+/// Stores keys/values as 8-bit (or configurable) quantized triples to cut resident KV memory
+/// roughly in half, while preserving the StreamingLLM sliding-window eviction (sink + window +
+/// RoPE re-indexing) semantics of the parent class.
+///
+/// ## Design (PoC / correctness-first)
+///
+/// Attention is transparent: this class conforms to ``QuantizedKVCacheProtocol``, so
+/// ``attentionWithCacheUpdate(queries:keys:values:cache:scale:mask:)`` automatically routes to
+/// `quantizedScaledDotProductAttention`. No model-side changes are required.
+///
+/// Eviction currently uses the simplest correct strategy ("方式 1"): dequantize the full valid
+/// region back to plaintext, delegate to the parent's plaintext `evict(tokenCount:)` (reusing all
+/// of its RoPE / M-RoPE logic verbatim), then re-quantize the surviving tokens. This peaks at the
+/// full fp16 KV size *during eviction only* (a low-frequency operation); resident memory between
+/// evictions stays quantized. A future optimization can dequantize only the window keys.
+///
+/// - Important: An internal ``QuantizedKVCache`` instance (`quant`) is the storage/attention
+///   engine. This class keeps the parent's plaintext `keys`/`values` **nil** except transiently
+///   inside `evict()`.
+public final class QuantizedStreamingKVCache: StreamingKVCache, QuantizedKVCacheProtocol {
+
+    /// Internal quantized storage + attention engine. All `update`/attention go through this.
+    /// `var` (not `let`) because eviction rebuilds a fresh engine to avoid stale internal buffers.
+    private var quant: QuantizedKVCache
+
+    public var groupSize: Int { quant.groupSize }
+    public var bits: Int { quant.bits }
+    public var mode: QuantizationMode { quant.mode }
+
+    /// Designated init. Mirrors ``StreamingKVCache/init`` plus quantization params.
+    public init(
+        keep: Int,
+        windowSize: Int,
+        ropeDimensions: Int,
+        ropeBase: Float,
+        ropeTraditional: Bool = false,
+        ropeScale: Float = 1.0,
+        mropeSection: [Int]? = nil,
+        bits: Int = 8,
+        groupSize: Int = 64,
+        mode: QuantizationMode = .affine
+    ) {
+        self.quant = QuantizedKVCache(groupSize: groupSize, bits: bits, mode: mode)
+        super.init(
+            keep: keep, windowSize: windowSize, ropeDimensions: ropeDimensions,
+            ropeBase: ropeBase, ropeTraditional: ropeTraditional, ropeScale: ropeScale,
+            mropeSection: mropeSection)
+    }
+
+    /// Build a quantized streaming cache from an existing plaintext ``StreamingKVCache``,
+    /// migrating its current keys/values into quantized storage. Used by
+    /// ``maybeQuantizeKVCache(cache:kvBits:kvGroupSize:quantizedKVStart:)``.
+    public convenience init(
+        from plain: StreamingKVCache, bits: Int, groupSize: Int, mode: QuantizationMode = .affine
+    ) {
+        self.init(
+            keep: plain.keep, windowSize: plain.windowSize,
+            ropeDimensions: plain.ropeDimensions, ropeBase: plain.ropeBase,
+            ropeTraditional: plain.ropeTraditional, ropeScale: plain.ropeScale,
+            mropeSection: plain.mropeSection, bits: bits, groupSize: groupSize, mode: mode)
+        self.step = plain.step
+        // Migrate the plaintext window mask so M-RoPE eviction still works.
+        self.adoptImageMask(from: plain)
+        // Migrate existing plaintext KV (if any) into quantized storage.
+        let s = plain.state  // [keys, values] trimmed to offset
+        if s.count == 2 {
+            _ = self.quant.updateQuantized(keys: s[0], values: s[1])
+        }
+        self.offset = plain.offset
+    }
+
+    // MARK: - Quantized protocol
+
+    public func updateQuantized(keys: MLXArray, values: MLXArray) -> (
+        (MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)
+    ) {
+        let result = quant.updateQuantized(keys: keys, values: values)
+        // Keep our offset in sync with the storage engine so evict()/masks see the right count.
+        self.offset = quant.offset
+        return result
+    }
+
+    public func getQuantizedState() -> (
+        (MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)
+    )? {
+        quant.getQuantizedState()
+    }
+
+    /// `update` should never be called on a quantized cache — attention goes through
+    /// `updateQuantized`. Mirror ``QuantizedKVCache``'s behavior.
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        fatalError(
+            "`update` was called on `QuantizedStreamingKVCache`. Use `updateQuantized` instead.")
+    }
+
+    // MARK: - Eviction (方式 1: dequantize → parent plaintext evict → re-quantize)
+
+    @discardableResult
+    public override func evict(tokenCount: Int) -> Int {
+        guard tokenCount > 0 else { return 0 }
+        guard let (qk, qv) = quant.getQuantizedState() else { return 0 }
+
+        // 1) Dequantize the full valid region back to plaintext into the parent's storage.
+        let plainKeys = dequantized(
+            qk.0, scales: qk.1, biases: qk.2, groupSize: groupSize, bits: bits, mode: mode)
+        let plainValues = dequantized(
+            qv.0, scales: qv.1, biases: qv.2, groupSize: groupSize, bits: bits, mode: mode)
+        self.keys = plainKeys
+        self.values = plainValues
+        // Parent evict() reads `offset` as the valid length; it already equals quant.offset.
+
+        // ⚠️⚠️⚠️ TEMP-KVQUANT-SELFCHECK BEGIN —— 验证通过后必须整段删除 ⚠️⚠️⚠️
+        // 自检：记录反量化后的“明文 K/V”作为基准，evict 后与“量化往返再反量化”的结果对比，
+        // 验证 dequant→RoPE 旋转→requant 这条链的数值误差。仅当 SMLX_KVQUANT_SELFCHECK=1 时启用。
+        let selfCheckOn =
+            ProcessInfo.processInfo.environment["SMLX_KVQUANT_SELFCHECK"] == "1"
+        var checkPlainKeys: MLXArray? = nil
+        var checkPlainValues: MLXArray? = nil
+        if selfCheckOn {
+            checkPlainKeys = plainKeys
+            checkPlainValues = plainValues
+        }
+        // ⚠️⚠️⚠️ TEMP-KVQUANT-SELFCHECK END ⚠️⚠️⚠️
+
+        // 2) Delegate to the parent's plaintext eviction (reuses all RoPE / M-RoPE logic).
+        let evicted = super.evict(tokenCount: tokenCount)
+
+        // 3) Re-quantize the surviving plaintext window back into quantized storage.
+        //    Rebuild the storage engine from scratch so its internal offset/buffers are clean.
+        let survKeys = self.keys
+        let survValues = self.values
+        quant = QuantizedKVCache(groupSize: groupSize, bits: bits, mode: mode)  // fresh engine
+        if let sk = survKeys, let sv = survValues {
+            _ = quant.updateQuantized(keys: sk, values: sv)
+        }
+        self.offset = quant.offset
+
+        // ⚠️⚠️⚠️ TEMP-KVQUANT-SELFCHECK BEGIN —— 验证通过后必须整段删除 ⚠️⚠️⚠️
+        if selfCheckOn, let baseK = checkPlainKeys, let baseV = checkPlainValues,
+            let (rqk, _) = quant.getQuantizedState() {
+            // 用父类明文 evict 一份基准（对 baseK/baseV 直接做同样的裁剪+旋转），
+            // 对比“量化往返 evict”的反量化结果。
+            let refCache = StreamingKVCache(
+                keep: keep, windowSize: windowSize, ropeDimensions: ropeDimensions,
+                ropeBase: ropeBase, ropeTraditional: ropeTraditional, ropeScale: ropeScale,
+                mropeSection: mropeSection)
+            refCache.adoptImageMaskForSelfCheck(from: self)
+            refCache.state = [baseK, baseV]
+            refCache.evict(tokenCount: tokenCount)
+            let refState = refCache.state  // [refKeys, refValues]
+
+            let deqK = dequantized(
+                rqk.0, scales: rqk.1, biases: rqk.2, groupSize: groupSize, bits: bits, mode: mode)
+            if refState.count == 2 {
+                let refK = refState[0]
+                let diff = (deqK - refK).abs().max().item(Float.self)
+                let scale = refK.abs().max().item(Float.self) + 1e-6
+                let relErr = diff / scale
+                let tag = relErr < 0.05 ? "OK" : "HIGH"
+                print(
+                    "TEMP-KVQUANT-SELFCHECK evict=\(evicted) K relErr=\(relErr) [\(tag)]")
+            }
+        }
+        // ⚠️⚠️⚠️ TEMP-KVQUANT-SELFCHECK END ⚠️⚠️⚠️
+
+        // Clear the transient plaintext buffers so resident memory stays quantized.
+        self.keys = nil
+        self.values = nil
+        return evicted
+    }
+
+    // MARK: - Serialization / copy
+
+    /// State layout matches ``QuantizedKVCache``: 6 arrays (or 4 if biases nil).
+    public override var state: [MLXArray] {
+        get { quant.state }
+        set { quant.state = newValue; self.offset = quant.offset }
+    }
+
+    /// metaState: streaming params (6) + quantization params (step/offset/groupSize/bits, 4) = 10.
+    public override var metaState: [String] {
+        get {
+            let base: [String] = [
+                String(keep), String(windowSize), String(ropeDimensions), String(ropeBase),
+                ropeTraditional ? "1" : "0", String(ropeScale),
+            ]
+            return base + quant.metaState
+        }
+        set {
+            guard newValue.count == 10 else {
+                fatalError("QuantizedStreamingKVCache metaState must have exactly 10 values")
+            }
+            self.keep = Int(newValue[0]) ?? 4
+            self.windowSize = Int(newValue[1]) ?? 1
+            self.ropeDimensions = Int(newValue[2]) ?? 0
+            self.ropeBase = Float(newValue[3]) ?? 10000
+            self.ropeTraditional = newValue[4] == "1"
+            self.ropeScale = Float(newValue[5]) ?? 1.0
+            quant.metaState = Array(newValue[6...])   // step/offset/groupSize/bits
+            self.offset = quant.offset
+        }
+    }
+
+    public override var isTrimmable: Bool { true }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = quant.trim(n)
+        self.offset = quant.offset
+        return trimmed
+    }
+
+    public override func copy() -> any KVCache {
+        let new = QuantizedStreamingKVCache(
+            keep: keep, windowSize: windowSize, ropeDimensions: ropeDimensions,
+            ropeBase: ropeBase, ropeTraditional: ropeTraditional, ropeScale: ropeScale,
+            mropeSection: mropeSection, bits: bits, groupSize: groupSize, mode: mode)
+        new.step = self.step
+        new.adoptImageMask(from: self)
+        let s = self.state
+        if !s.isEmpty { new.state = s.map { $0[.ellipsis] } }
+        new.metaState = self.metaState
+        return new
+    }
+
+    public override func innerState() -> [MLXArray] { quant.innerState() }
 }
 
 /// Base cache for array-based state storage
@@ -2362,17 +2608,27 @@ public func maybeQuantizeKVCache(
 ) {
     guard let kvBits = kvBits, !cache.isEmpty else { return }
 
-    // Find the first quantizable (non-Mamba, non-already-quantized) cache entry
+    // Find the first quantizable (non-Mamba, non-already-quantized) cache entry.
+    // NOTE: QuantizedStreamingKVCache is NOT a subclass of QuantizedKVCache, so it must be
+    // excluded explicitly here to avoid re-quantizing an already-quantized streaming cache.
     guard let firstQuantizable = cache.first(where: { $0 is KVCacheSimple }),
         !(firstQuantizable is QuantizedKVCache),
+        !(firstQuantizable is QuantizedStreamingKVCache),
         firstQuantizable.offset > quantizedKVStart
     else {
         return
     }
 
     for i in 0 ..< cache.count {
-        // Handle cache types that support quantization
-        if let simpleCache = cache[i] as? KVCacheSimple {
+        // StreamingKVCache must be checked BEFORE KVCacheSimple (it is a subclass) and converted
+        // to a QuantizedStreamingKVCache that preserves sliding-window eviction, NOT a plain
+        // QuantizedKVCache (which would drop evict/RoPE-shift capability).
+        if let streaming = cache[i] as? StreamingKVCache,
+            !(streaming is QuantizedStreamingKVCache) {
+            cache[i] = QuantizedStreamingKVCache(
+                from: streaming, bits: kvBits, groupSize: kvGroupSize)
+        } else if let simpleCache = cache[i] as? KVCacheSimple,
+            !(simpleCache is QuantizedStreamingKVCache) {
             cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
         }
         // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
