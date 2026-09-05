@@ -12,7 +12,16 @@ private enum Qwen3VLError: Error {
     case featureTokenMismatch(expected: Int, actual: Int)
 }
 
+/// VLM 模型暴露 chunked prefill 进度回调的统一协议。
+/// smlx 侧通过 `context.model as? VLMPrefillProgressReporting` 设置回调，
+/// 无需区分具体模型类型（Qwen35 / Qwen3VL 均 conform）。
+public protocol VLMPrefillProgressReporting: AnyObject {
+    var prefillProgressCallback: (@Sendable (_ processed: Int, _ total: Int) -> Void)? { get set }
+}
+
 private let ropeDeltasKey = LMOutput.Key<MLXArray>("qwen35vl.ropeDeltas")
+// [VLM-Phase2] 增量 prefill：缓存全量 M-RoPE 位置，供后续轮次按 cacheOffset 切片复用。
+private let precomputedPositionIdsKey = LMOutput.Key<MLXArray>("qwen3vl.precomputedPositionIds")
 
 // MARK: - Processor
 
@@ -1251,13 +1260,47 @@ enum Qwen3VLLanguage {
             var state = state ?? .init()
 
             if pixelValues != nil {
+                state[precomputedPositionIdsKey] = nil
                 state[ropeDeltasKey] = nil
+            }
+            let precomputedPositionIds = state[precomputedPositionIdsKey]
+            let ropeDeltas = state[ropeDeltasKey]
+
+            // 当前 cache 的绝对偏移（所有层同类型标准 attention，取第一层即可）。
+            let cacheOffset = cache?.first?.offset ?? 0
+
+            var ropeMask = mask
+            if let mask, mask.dim(-1) != (inputIds ?? inputEmbeddings!).dim(-1) {
+                ropeMask = nil
             }
 
             var positionIds = providedPositionIds
-
-            if positionIds == nil && (mask == nil || mask?.ndim == 2) {
-                if (cache?.first?.offset ?? 0) == 0 || state[ropeDeltasKey] == nil || cache == nil {
+            if positionIds == nil && (ropeMask == nil || ropeMask?.ndim == 2) {
+                // ★ 分支 1：使用 prepare 预计算的全量位置，按 cacheOffset 切片。
+                //    仅当预计算长度覆盖到当前 cacheOffset 之后（prefill 内部）才有效，
+                //    排除 decode 场景（预计算位置已"用完"）。
+                if let precomputedPositionIds, precomputedPositionIds.dim(-1) > cacheOffset {
+                    let seqLength = (inputIds ?? inputEmbeddings!).dim(1)
+                    positionIds =
+                        precomputedPositionIds[
+                            0..., 0..., cacheOffset ..< (cacheOffset + seqLength)]
+                } else if imageGridTHW == nil && videoGridTHW == nil && ropeDeltas == nil {
+                    // ★ 分支 2：纯文本快速路径 —— 仅当从未建立过 ropeDeltas（真正从未见过
+                    //    图片的会话）才适用。decode 阶段的标准接口永远传 imageGridTHW=nil，
+                    //    但如果历史 prefill 已算出非零 ropeDeltas（说明历史含图），必须落到
+                    //    分支 4（cacheOffset+ropeDeltas），不能在这里被误判为纯文本清零 delta，
+                    //    否则新 token 的位置会比真实值少一个图片造成的位置跳跃量，导致
+                    //    query/key 位置基准不一致、attention 错位（多轮带图复读/答非所问）。
+                    //    位置 = cacheOffset 起的线性绝对位置（M-RoPE 三通道相同）。
+                    let batch = (inputIds ?? inputEmbeddings!).dim(0)
+                    let seqLength = (inputIds ?? inputEmbeddings!).dim(1)
+                    var base = MLXArray(0 ..< seqLength).asType(.int32)
+                    base = broadcast(base[.newAxis, 0...], to: [batch, seqLength])
+                    base = base + MLXArray(Int32(cacheOffset))
+                    positionIds = broadcast(base[.newAxis, 0..., 0...], to: [3, batch, seqLength])
+                    state[ropeDeltasKey] = MLXArray.zeros([batch], dtype: .int32)
+                } else if cacheOffset == 0 || ropeDeltas == nil || cache == nil {
+                    // ★ 分支 3：首轮 / 带图全新 prefill —— 用 getRopeIndex 算全量 3D 位置并缓存。
                     if let inputIds {
                         let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
                             inputIds: inputIds,
@@ -1267,43 +1310,42 @@ enum Qwen3VLLanguage {
                             imageTokenId: config.imageTokenIndex,
                             videoTokenId: config.videoTokenIndex,
                             visionStartTokenId: config.visionStartTokenId,
-                            attentionMask: mask)
-
+                            attentionMask: ropeMask)
                         positionIds = computed
+                        state[precomputedPositionIdsKey] = computed
                         state[ropeDeltasKey] = deltas
-                    } else if let cache, state[ropeDeltasKey] == nil {
+                    } else if cache != nil {
                         let batch = inputEmbeddings!.dim(0)
                         let seqLength = inputEmbeddings!.dim(1)
-                        let currentOffset = cache.first?.offset ?? 0
-
                         var base = MLXArray(0 ..< seqLength).asType(.int32)
                         base = tiled(base[.newAxis, 0...], repetitions: [batch, 1])
-                        let offsetValue = MLXArray(currentOffset).asType(.int32)
-                        base = base + offsetValue
-
+                        base = base + MLXArray(Int32(cacheOffset))
                         positionIds = base[.newAxis, 0..., 0...]
-                        positionIds = tiled(positionIds!, repetitions: [3, batch, seqLength])
+                        positionIds = tiled(positionIds!, repetitions: [3, 1, 1])
                     }
-                } else if let cache, let ropeDeltas = state[ropeDeltasKey] {
+                } else {
+                    // ★ 分支 4：decode 单步 —— 位置 = cacheOffset + ropeDeltas。
                     let batch = (inputIds ?? inputEmbeddings!).dim(0)
                     let seqLength = (inputIds ?? inputEmbeddings!).dim(1)
 
-                    let lastCacheOffset = cache.last?.offset ?? 0
-
-                    var delta = MLXArray(lastCacheOffset).asType(.int32) + ropeDeltas.asType(.int32)
-
-                    var base = MLXArray(0 ..< seqLength).asType(.int32)
-                    base = base[.newAxis, 0...]
-                    base = broadcast(base, to: [batch, seqLength])
-
-                    if delta.dim(0) == 1 && batch > 1 {
-                        delta = repeated(delta, count: batch, axis: 0)
+                    var delta = MLXArray(Int32(cacheOffset)).asType(.int32)
+                    if let ropeDeltas {
+                        delta = delta + ropeDeltas.asType(.int32)
                     }
 
-                    base = base + delta
+                    var base = MLXArray(0 ..< seqLength).asType(.int32)
+                    base = broadcast(base[.newAxis, 0...], to: [batch, seqLength])
 
-                    positionIds = base[.newAxis, 0..., 0...]
-                    positionIds = broadcast(positionIds!, to: [3, batch, seqLength])
+                    if delta.ndim == 0 {
+                        delta = broadcast(delta, to: [batch])
+                    } else if delta.dim(0) == 1 && batch > 1 {
+                        delta = repeated(delta, count: batch, axis: 0)
+                    } else if delta.dim(0) > batch {
+                        delta = delta[0 ..< batch]
+                    }
+
+                    base = base + delta[0..., .newAxis]
+                    positionIds = broadcast(base[.newAxis, 0..., 0...], to: [3, batch, seqLength])
                 }
             }
 
@@ -1517,12 +1559,16 @@ extension Qwen3VLLanguage {
 
 // MARK: - Model
 
-public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
+public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider, VLMPrefillProgressReporting {
 
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") private var languageModel: Qwen3VLLanguage.LanguageModel
 
     public let config: Qwen3VLConfiguration
+
+    /// Chunked prefill 进度回调 (已处理 token 数, 总数)。
+    /// smlx 侧 set 此回调后，prepare() 会在每个 chunk 完成后调用（与 Qwen35 对齐）。
+    public var prefillProgressCallback: (@Sendable (_ processed: Int, _ total: Int) -> Void)?
 
     public init(_ config: Qwen3VLConfiguration) {
         self.config = config
@@ -1535,6 +1581,32 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
 
     public var loraLayers: [Module] {
         languageModel.model.layers
+    }
+
+    /// [VLM-Phase2] 自定义 KV cache：maxKVSize 有值时返回 StreamingKVCache（支持 sink/window
+    /// evict + M-RoPE 分段 shift 跨轮复用），与 smlx executeVisionInference 的 cache 逻辑对齐。
+    /// Qwen3VL 全层标准 attention（无 GatedDeltaNet/Mamba），故所有层统一返回同类型 cache。
+    /// RoPE 参数取自 config：headDim=128 全量 RoPE（NeoX half-split），
+    /// mropeSection=[24,20,20]（和=64=headDim/2），ropeBase=rope_theta（本模型 5e6）。
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let vc = config.textConfiguration
+        let headDim = vc.headDim
+        let mrope = vc.ropeScaling?.mropeSection ?? [24, 20, 20]
+        let numLayers = vc.numHiddenLayers
+        if let maxKVSize = parameters?.maxKVSize {
+            return (0 ..< numLayers).map { _ in
+                StreamingKVCache(
+                    keep: 4,
+                    windowSize: maxKVSize,
+                    ropeDimensions: headDim,
+                    ropeBase: Float(vc.ropeTheta),
+                    ropeTraditional: false,
+                    ropeScale: 1.0,
+                    mropeSection: mrope
+                )
+            }
+        }
+        return (0 ..< numLayers).map { _ in KVCacheSimple() }
     }
 
     private func mergeInputIdsWithImageFeatures(
@@ -1611,85 +1683,278 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(
         _ input: LMInput,
         cache: [any KVCache],
-        windowSize _: Int?
+        windowSize: Int?
     ) throws -> PrepareResult {
+        let prefillStepSize = windowSize ?? 512
         let inputIds = input.text.tokens
+        let totalLength = inputIds.dim(1)
+        let typedCache = castCache(cache)
+        let cacheOffset = typedCache?.first?.offset ?? 0
 
-        var pixelValues: MLXArray?
+        // ── 1. 收集像素与帧网格（此处不跑 vision tower）───────────────────────
+        let dtype = visionModel.patchEmbed.proj.weight.dtype
+        var pixelParts: [MLXArray] = []
         var imageFrames: [THW]? = nil
         var videoFrames: [THW]? = nil
-
-        let dtype = visionModel.patchEmbed.proj.weight.dtype
-
-        var pixelParts: [MLXArray] = []
-
         if let image = input.image {
             pixelParts.append(image.pixels.asType(dtype))
             imageFrames = image.frames
         }
-
         if let video = input.video {
             pixelParts.append(video.pixels.asType(dtype))
             videoFrames = video.frames
         }
+        let allPixelValues: MLXArray? = pixelParts.isEmpty ? nil : concatenated(pixelParts)
 
-        if !pixelParts.isEmpty {
-            pixelValues = concatenated(pixelParts)
+        // ── 2. 扫描 image/video pad token 段并与 frames 做结构校验 ────────────
+        let mergeSize = config.visionConfiguration.spatialMergeSize
+        let mergeSquare = mergeSize * mergeSize
+        let ids = inputIds.asArray(Int.self)
+        var runs: [(isVideo: Bool, range: Range<Int>)] = []
+        var scanIdx = 0
+        while scanIdx < ids.count {
+            let t = ids[scanIdx]
+            if t == config.imageTokenIndex || t == config.videoTokenIndex {
+                let isVideo = (t == config.videoTokenIndex)
+                var end = scanIdx + 1
+                while end < ids.count && ids[end] == t { end += 1 }
+                runs.append((isVideo, scanIdx ..< end))
+                scanIdx = end
+            } else {
+                scanIdx += 1
+            }
+        }
+        let imageRuns = runs.filter { !$0.isVideo }
+        let videoRuns = runs.filter { $0.isVideo }
+
+        var structureOK =
+            imageRuns.count == (imageFrames?.count ?? 0)
+            && videoRuns.count == (videoFrames?.count ?? 0)
+        if structureOK, let imageFrames {
+            for (run, frame) in zip(imageRuns, imageFrames)
+            where run.range.count != frame.product / mergeSquare {
+                structureOK = false
+                break
+            }
+        }
+        if structureOK, let videoFrames {
+            for (run, frame) in zip(videoRuns, videoFrames)
+            where run.range.count != frame.product / mergeSquare {
+                structureOK = false
+                break
+            }
         }
 
-        var inputEmbeddings: MLXArray? = nil
-        var visualMask: MLXArray?
-        var deepstackEmbeds: [MLXArray]? = nil
+        // ── 3. 判定增量可行性 ────────────────────────────────────────────────
+        var startPos = 0
+        var cachedImageCount = 0
+        var cachedVideoCount = 0
+        if cacheOffset > 0 {
+            let canIncrement =
+                structureOK && totalLength > cacheOffset
+                && runs.allSatisfy {
+                    $0.range.upperBound <= cacheOffset || $0.range.lowerBound >= cacheOffset
+                }
+            guard canIncrement else {
+                print(
+                    "⚠️ [Qwen3VL] cache diverged: offset=\(cacheOffset) total=\(totalLength) "
+                        + "runs=\(runs.map { "\($0.isVideo ? "v" : "i")\($0.range)" }) structureOK=\(structureOK)"
+                )
+                throw VLMError.cacheDiverged
+            }
+            startPos = cacheOffset
+            cachedImageCount = imageRuns.filter { $0.range.upperBound <= cacheOffset }.count
+            cachedVideoCount = videoRuns.filter { $0.range.upperBound <= cacheOffset }.count
+        }
+        let freshLength = totalLength - startPos
+        if startPos > 0 {
+            print(
+                "⚡ [Qwen3VL] incremental prefill: skip=\(cacheOffset) fresh=\(freshLength)/\(totalLength) newImages=\(imageRuns.count - cachedImageCount) newVideos=\(videoRuns.count - cachedVideoCount)"
+            )
+        }
 
-        if let pixelValues,
-            let framesList = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
-                .nilIfEmpty
+        // ── 4. vision tower：只跑新增图片/视频（旧图特征已在 KV cache 中）─────
+        // 像素布局：[全部图片行..., 全部视频行...]，每张图行数 = frame.product（patchify）。
+        let imageRowCounts = (imageFrames ?? []).map { $0.product }
+        let videoRowCounts = (videoFrames ?? []).map { $0.product }
+        var pixelValuesToEncode: MLXArray?
+        var framesToEncode: [THW]?
+        if let allPixelValues {
+            if structureOK {
+                let newImageStartRow = imageRowCounts[..<cachedImageCount].reduce(0, +)
+                let newImageRowCount = imageRowCounts[cachedImageCount...].reduce(0, +)
+                let newVideoStartRow =
+                    imageRowCounts.reduce(0, +)
+                    + videoRowCounts[..<cachedVideoCount].reduce(0, +)
+                let newVideoRowCount = videoRowCounts[cachedVideoCount...].reduce(0, +)
+                var newParts: [MLXArray] = []
+                var newFrames: [THW] = []
+                if newImageRowCount > 0 {
+                    newParts.append(
+                        allPixelValues[
+                            newImageStartRow ..< (newImageStartRow + newImageRowCount), 0...])
+                    newFrames.append(contentsOf: (imageFrames ?? [])[cachedImageCount...])
+                }
+                if newVideoRowCount > 0 {
+                    newParts.append(
+                        allPixelValues[
+                            newVideoStartRow ..< (newVideoStartRow + newVideoRowCount), 0...])
+                    newFrames.append(contentsOf: (videoFrames ?? [])[cachedVideoCount...])
+                }
+                if !newParts.isEmpty {
+                    pixelValuesToEncode =
+                        newParts.count == 1 ? newParts[0] : concatenated(newParts)
+                    framesToEncode = newFrames
+                }
+            } else {
+                // 结构异常（仅全新 prefill 可达）：退回旧行为，全量编码。
+                pixelValuesToEncode = allPixelValues
+                framesToEncode = combinedFrames(
+                    imageFrames: imageFrames, videoFrames: videoFrames)
+            }
+        }
+
+        // ── 5. 文本 embedding + 视觉特征合并（含 deepstack）──────────────────
+        // 注意：inputEmbeddings / visualMask / deepstackEmbeds 都以「后缀段」为坐标系
+        //       （从 startPos 起、长度 freshLength），与后续前向传入的 token 段严格对齐。
+        var suffixEmbeddings: MLXArray?  // [1, freshLength, hidden]
+        var suffixVisualMask: MLXArray?  // [1, freshLength]（deepstack 用，后缀局部坐标）
+        var suffixDeepstack: [MLXArray]? = nil  // 每层特征仅含新图 token
+        if let pixelValuesToEncode,
+            let frames = framesToEncode?.nilIfEmpty
         {
-            let textEmbeds = languageModel.model.embedTokens(inputIds)
-            let (visionHidden, deepstackOutputs) = visionModel(pixelValues, gridTHW: framesList)
-            let mergeSize = config.visionConfiguration.spatialMergeSize
-            let splits = framesList.map { $0.product / (mergeSize * mergeSize) }
+            let textEmbeds = languageModel.model.embedTokens(inputIds)  // [1, total, hidden]
+            let (visionHidden, deepstackOutputs) = visionModel(pixelValuesToEncode, gridTHW: frames)
+            let splits = frames.map { $0.product / mergeSquare }
             let splitIndices = cumulativeSplitIndices(from: splits)
             let featureSlices = visionHidden.split(indices: splitIndices)
-            let flattenedFeatures = concatenated(featureSlices).asType(textEmbeds.dtype)
+            let visionFeatures = concatenated(featureSlices).asType(textEmbeds.dtype)
 
-            let (mergedEmbeds, mask) = try mergeInputIdsWithImageFeatures(
-                imageFeatures: flattenedFeatures,
-                inputEmbeds: textEmbeds,
-                inputIds: inputIds,
-                imageTokenIndex: config.imageTokenIndex,
-                videoTokenIndex: config.videoTokenIndex)
+            // 新图 run（特征布局顺序：先图片后视频，与 pixelParts 一致）。
+            let newRunsInFeatureOrder =
+                imageRuns.filter { $0.range.lowerBound >= startPos }
+                + videoRuns.filter { $0.range.lowerBound >= startPos }
 
-            inputEmbeddings = mergedEmbeds
-            visualMask = mask
+            // 把新图特征写入其 pad token 的绝对位置。
+            let embeds = textEmbeds
+            var featureOffset = 0
+            for run in newRunsInFeatureOrder {
+                let n = run.range.count
+                embeds[0..., run.range, 0...] =
+                    visionFeatures[featureOffset ..< (featureOffset + n), 0...]
+                    .expandedDimensions(axis: 0)
+                featureOffset += n
+            }
+            guard featureOffset == visionFeatures.dim(0) else {
+                throw Qwen3VLError.featureTokenMismatch(
+                    expected: featureOffset, actual: visionFeatures.dim(0))
+            }
+            // 切出后缀段作为本次前向输入。
+            suffixEmbeddings = embeds[0..., startPos..., 0...]
 
+            // deepstack：构造「后缀局部坐标」的 visualMask 与仅含新图的每层特征。
             if !deepstackOutputs.isEmpty {
-                deepstackEmbeds = deepstackOutputs.map { layerFeatures in
-                    let splitIndices = cumulativeSplitIndices(from: splits)
+                var maskBools = [Bool](repeating: false, count: freshLength)
+                for run in newRunsInFeatureOrder {
+                    for i in run.range { maskBools[i - startPos] = true }
+                }
+                suffixVisualMask =
+                    MLXArray(maskBools.map { $0 ? Int32(1) : Int32(0) })
+                    .reshaped([1, freshLength]).asType(.bool)
+                suffixDeepstack = deepstackOutputs.map { layerFeatures in
                     let slices = layerFeatures.split(indices: splitIndices)
-                    let concatenatedSlices = concatenated(slices).asType(textEmbeds.dtype)
-                    return concatenatedSlices
+                    return concatenated(slices).asType(textEmbeds.dtype)
                 }
             }
         }
 
-        let typedCache = castCache(cache)
+        // ── 6. 记录新增图片 token 掩码（StreamingKVCache evict 的 M-RoPE 分段 shift）─
+        if !runs.isEmpty {
+            var suffixMask = [Bool](repeating: false, count: freshLength)
+            for run in runs where run.range.lowerBound >= startPos {
+                for i in run.range { suffixMask[i - startPos] = true }
+            }
+            for c in cache {
+                (c as? StreamingKVCache)?.updateImageMask(suffixMask, from: startPos)
+            }
+        }
 
-        let languageOutput = languageModel(
-            inputIds,
-            cache: typedCache,
-            state: nil,
-            inputEmbeddings: inputEmbeddings,
-            mask: nil,
-            positionIds: nil,
-            visualMask: visualMask,
-            deepstackEmbeds: deepstackEmbeds,
-            pixelValues: pixelValues,
+        // ── 7. 全量 M-RoPE 位置预计算（增量与全量统一，切片后严格正确）─────────
+        let (fullPositionIds, ropeDeltas) = Qwen3VLLanguage.getRopeIndex(
+            inputIds: inputIds,
             imageGridTHW: imageFrames,
-            videoGridTHW: videoFrames)
+            videoGridTHW: videoFrames,
+            spatialMergeSize: mergeSize,
+            imageTokenId: config.imageTokenIndex,
+            videoTokenId: config.videoTokenIndex,
+            visionStartTokenId: config.visionStartTokenId,
+            attentionMask: input.text.mask)
+        var precomputedState = LMOutput.State()
+        precomputedState[precomputedPositionIdsKey] = fullPositionIds
+        precomputedState[ropeDeltasKey] = ropeDeltas
 
-        return .logits(languageOutput)
+        // ── 8. 分块或单次前向（只处理 cache 之外的新增后缀）───────────────────
+        // 注意：带 deepstack 时不分块（deepstack 特征/mask 是整段后缀坐标，分块会错位），
+        // 仅纯文本或无 deepstack 的长后缀才分块。
+        let chunkThreshold = startPos > 0 ? max(prefillStepSize, 512) : prefillStepSize
+        let canChunk = (suffixDeepstack == nil)
+
+        prefillProgressCallback?(0, freshLength)
+
+        var lastOutput: LMOutput?
+        if canChunk && freshLength > chunkThreshold {
+            var offset = 0
+            var runningState: LMOutput.State? = precomputedState
+            while offset < freshLength {
+                let chunkEnd = min(offset + prefillStepSize, freshLength)
+                let absFrom = startPos + offset
+                let absTo = startPos + chunkEnd
+                let chunkIds = inputIds[0..., absFrom ..< absTo]
+                let chunkEmbeds = suffixEmbeddings?[0..., offset ..< chunkEnd, 0...]
+                let chunkPosIds = fullPositionIds[0..., 0..., absFrom ..< absTo]
+
+                let output = languageModel(
+                    chunkIds,
+                    cache: typedCache,
+                    state: runningState,
+                    inputEmbeddings: chunkEmbeds,
+                    mask: nil,
+                    positionIds: chunkPosIds,
+                    visualMask: nil,
+                    deepstackEmbeds: nil,
+                    pixelValues: nil,
+                    imageGridTHW: nil,
+                    videoGridTHW: nil)
+                runningState = output.state
+                lastOutput = output
+                asyncEval(cache)
+                offset = chunkEnd
+                prefillProgressCallback?(chunkEnd, freshLength)
+            }
+            eval(cache)
+        } else {
+            // 单次前向（增量小 prompt、带 deepstack、或全新小 prompt）。
+            let suffixIds = inputIds[0..., startPos...]
+            let suffixPosIds = fullPositionIds[0..., 0..., startPos ..< totalLength]
+            let output = languageModel(
+                suffixIds,
+                cache: typedCache,
+                state: precomputedState,
+                inputEmbeddings: suffixEmbeddings,
+                mask: nil,
+                positionIds: suffixPosIds,
+                visualMask: suffixVisualMask,
+                deepstackEmbeds: suffixDeepstack,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil)
+            lastOutput = output
+            prefillProgressCallback?(freshLength, freshLength)
+        }
+
+        return .logits(lastOutput!)
     }
+
 
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?

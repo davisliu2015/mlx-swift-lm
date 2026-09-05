@@ -1248,7 +1248,7 @@ enum Qwen35Language {
 
 // MARK: - Model
 
-public class Qwen35: Module, VLMModel, MTPCapableModel {
+public class Qwen35: Module, VLMModel, MTPCapableModel, VLMPrefillProgressReporting {
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 

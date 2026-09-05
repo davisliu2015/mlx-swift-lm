@@ -649,6 +649,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             asyncEval(y.tokens)
 
         case .logits(let result):
+            // [Bug fix 2026-09-05] 之前这里没有保存 result.state，导致 prepare() 阶段
+            // 算出的增量状态（如 Qwen3VL/Qwen35 的 precomputedPositionIds/ropeDeltas）
+            // 在后续 decode 的第一个 step() 里丢失（step 以 state=nil 起步），
+            // 造成多轮带图对话 decode 阶段 M-RoPE 位置错位（复读/答非所问）。
+            self.state = result.state
             y = .init(tokens: convertToToken(logits: result.logits))
             asyncEval(y.tokens)
 
