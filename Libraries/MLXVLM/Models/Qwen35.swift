@@ -1063,8 +1063,19 @@ enum Qwen35Language {
                     positionIds =
                         precomputedPositionIds[
                             0..., 0..., cacheOffset ..< (cacheOffset + seqLength)]
-                } else if imageGridTHW == nil && videoGridTHW == nil {
-                    // ★ 纯文本快速路径：位置 = cacheOffset 起的线性绝对位置（M-RoPE 三通道相同）。
+                } else if imageGridTHW == nil && videoGridTHW == nil && ropeDeltas == nil {
+                    // ★ 纯文本快速路径：仅在从未建立过 ropeDeltas（真正从未见过图片的会话）
+                    //    时才适用。decode 阶段标准接口永远传 imageGridTHW=nil，但如历史
+                    //    prefill 已算出非零 ropeDeltas（历史含图），必须落到下面的
+                    //    cacheOffset+delta 分支，不能在此误判为纯文本清零 delta，否则新
+                    //    token 位置会比真实值少一个图片造成的位置跳跃量，导致 query/key
+                    //    位置基准不一致、attention 错位（多轮带图复读/答非所问）。
+                    //    [2026-09-05 修复：原条件只判 imageGridTHW==nil，decode 阶段恒真，
+                    //    ropeDeltas 永远被清零，L1070 处"供后续 decode 走 delta 分支"的
+                    //    设计意图从未真正生效；配合 Evaluate.swift TokenIterator.prepare
+                    //    的 state 传递修复才完整生效，详见
+                    //    mlx-swift-lm/docs/davis-qwen3vl-decode-position-bug-20260905.md]
+                    // 位置 = cacheOffset 起的线性绝对位置（M-RoPE 三通道相同）。
                     // 原先走 getRopeIndex 会对"增量后缀片段"返回 0-based 位置（无前缀上下文），
                     // 与前缀位置冲突；这里直接按 cacheOffset 连续排布，deltas 记 0
                     // （供后续 decode 步走 cacheOffset + delta 分支，行为不变）。
