@@ -1209,13 +1209,24 @@ func applyUniformRoPEShift(
 ///   - sections: M-RoPE section sizes (frequency pair counts per group)
 ///   - dims: total rotary dimensions
 ///   - base: RoPE theta base
+///   - interleaved: frequency-channel → section assignment layout.
+///     `false` (default) = **contiguous** blocks in section order
+///     (Qwen2-VL / Qwen2.5-VL: first `sections[0]` freq pairs = text,
+///     next `sections[1]` = height, last `sections[2]` = width).
+///     `true` = **interleaved** every-3rd assignment (Qwen3-VL / Qwen3.5(Qwen35)
+///     with `mrope_interleaved: true`: freq index `i` belongs to height when
+///     `i % 3 == 1` (within `sections[1]*3` range), width when `i % 3 == 2`
+///     (within `sections[2]*3` range), text otherwise). Passing the wrong value
+///     for a given model applies each section's delta to the wrong physical
+///     channels, corrupting M-RoPE position encoding for the shifted tokens.
 /// - Returns: `x` with each section shifted by its corresponding delta.
 func applyMRoPEShift(
     _ x: MLXArray,
     deltas: [Int],
     sections: [Int],
     dims: Int,
-    base: Float
+    base: Float,
+    interleaved: Bool = false
 ) -> MLXArray {
     let d = x.dim(x.ndim - 1)
     let rotaryDims = min(dims, d)
@@ -1223,21 +1234,52 @@ func applyMRoPEShift(
     let half = rotaryDims / 2
     precondition(sections.reduce(0, +) == half, "sections sum must equal rotary_dims/2")
 
+    // Per-frequency-index → section-index mapping, matching the model's own
+    // RotaryEmbedding channel layout exactly (must stay in lockstep with
+    // Qwen2VL.applyMultimodalRotaryPositionEmbedding / Qwen3VL & Qwen35's
+    // applyInterleavedMRope, or the shifted keys will rotate the wrong channels).
+    let sectionOf: (Int) -> Int
+    if interleaved {
+        // Every-3rd assignment: index i belongs to section `dim` (1=height, 2=width)
+        // when i falls in [dim, min(sections[dim]*3, half)) and (i - dim) % 3 == 0;
+        // all remaining indices are text (section 0). Mirrors applyInterleavedMRope.
+        sectionOf = { idx in
+            for dim in [1, 2] {
+                let end = min(sections[dim] * 3, half)
+                if idx >= dim && idx < end && (idx - dim) % 3 == 0 {
+                    return dim
+                }
+            }
+            return 0
+        }
+    } else {
+        // Contiguous blocks in section order: [0, s0) = 0, [s0, s0+s1) = 1, ...
+        var boundaries: [Int] = []
+        var acc = 0
+        for s in sections {
+            acc += s
+            boundaries.append(acc)
+        }
+        sectionOf = { idx in
+            for (secIdx, bound) in boundaries.enumerated() where idx < bound {
+                return secIdx
+            }
+            return sections.count - 1
+        }
+    }
+
     // Precompute per-frequency-pair cos/sin values.
     // Each section gets its own delta → different rotation angles.
     var cosValues = [Float](repeating: 0, count: half)
     var sinValues = [Float](repeating: 0, count: half)
-    var freqIdx = 0
-    for (secIdx, secSize) in sections.enumerated() {
-        let delta = deltas[secIdx]
-        for _ in 0..<secSize {
-            let invFreq = 1.0 / pow(Double(base), Double(2 * freqIdx) / Double(dims))
-            let angle = Double(delta) * invFreq
-            cosValues[freqIdx] = Float(Foundation.cos(angle))
-            sinValues[freqIdx] = Float(Foundation.sin(angle))
-            freqIdx += 1
-        }
+    for freqIdx in 0..<half {
+        let delta = deltas[sectionOf(freqIdx)]
+        let invFreq = 1.0 / pow(Double(base), Double(2 * freqIdx) / Double(dims))
+        let angle = Double(delta) * invFreq
+        cosValues[freqIdx] = Float(Foundation.cos(angle))
+        sinValues[freqIdx] = Float(Foundation.sin(angle))
     }
+
 
     // Match key dtype to avoid silent float32 promotion (same rationale as
     // applyUniformRoPEShift).
@@ -1320,6 +1362,15 @@ public class StreamingKVCache: KVCacheSimple {
     // e.g. [11, 11, 10] for Qwen3.5: 11 text freq pairs, 11 height, 10 width.
     internal var mropeSection: [Int]?
 
+    // Frequency-channel → section layout for the M-RoPE shift above (see
+    // `applyMRoPEShift(interleaved:)`). MUST match the model's own RotaryEmbedding:
+    // `false` = contiguous blocks (Qwen2-VL / Qwen2.5-VL), `true` = interleaved
+    // every-3rd assignment (Qwen3-VL / Qwen3.5, both have `mrope_interleaved: true`
+    // and hardcode `applyInterleavedMRope` unconditionally). Ignored when
+    // `mropeSection == nil`. Getting this wrong silently rotates the wrong
+    // physical channels for shifted image tokens after an eviction.
+    internal var mropeInterleaved: Bool
+
     /// Per-position flag: `imageTokenMask[pos] == true` → position `pos` is an image visual token.
     /// Image tokens need a different RoPE shift than text tokens during eviction
     /// (height/width position components should not move when text tokens shift).
@@ -1337,6 +1388,8 @@ public class StreamingKVCache: KVCacheSimple {
     ///   - ropeTraditional: whether RoPE uses the interleaved layout (default `false`).
     ///   - ropeScale: RoPE position scale (`1.0` for none, `1/factor` for linear scaling).
     ///   - mropeSection: M-RoPE section sizes for segmented shift (nil → uniform shift).
+    ///   - mropeInterleaved: M-RoPE frequency-channel layout (see ``mropeInterleaved``
+    ///     above). Only meaningful when `mropeSection` is non-nil.
     public init(
         keep: Int = 4,
         windowSize: Int,
@@ -1344,7 +1397,8 @@ public class StreamingKVCache: KVCacheSimple {
         ropeBase: Float,
         ropeTraditional: Bool = false,
         ropeScale: Float = 1.0,
-        mropeSection: [Int]? = nil
+        mropeSection: [Int]? = nil,
+        mropeInterleaved: Bool = false
     ) {
         precondition(keep >= 0, "keep must be >= 0")
         precondition(windowSize > 0, "windowSize must be > 0")
@@ -1355,6 +1409,7 @@ public class StreamingKVCache: KVCacheSimple {
         self.ropeTraditional = ropeTraditional
         self.ropeScale = ropeScale
         self.mropeSection = mropeSection
+        self.mropeInterleaved = mropeInterleaved
         super.init()
     }
 
@@ -1495,7 +1550,8 @@ public class StreamingKVCache: KVCacheSimple {
                         deltas: [-evict, 0, 0],  // text moves, h/w stay
                         sections: sections,
                         dims: ropeDimensions,
-                        base: ropeBase
+                        base: ropeBase,
+                        interleaved: mropeInterleaved
                     )
                     for (i, idx) in imageIndices.enumerated() {
                         mergedKeys[0..., 0..., idx, 0...] =
@@ -1549,7 +1605,8 @@ public class StreamingKVCache: KVCacheSimple {
             ropeBase: ropeBase,
             ropeTraditional: ropeTraditional,
             ropeScale: ropeScale,
-            mropeSection: mropeSection
+            mropeSection: mropeSection,
+            mropeInterleaved: mropeInterleaved
         )
         new.imageTokenMask = self.imageTokenMask
         new.step = self.step
@@ -1625,6 +1682,7 @@ public final class QuantizedStreamingKVCache: StreamingKVCache, QuantizedKVCache
         ropeTraditional: Bool = false,
         ropeScale: Float = 1.0,
         mropeSection: [Int]? = nil,
+        mropeInterleaved: Bool = false,
         bits: Int = 8,
         groupSize: Int = 64,
         mode: QuantizationMode = .affine
@@ -1633,7 +1691,7 @@ public final class QuantizedStreamingKVCache: StreamingKVCache, QuantizedKVCache
         super.init(
             keep: keep, windowSize: windowSize, ropeDimensions: ropeDimensions,
             ropeBase: ropeBase, ropeTraditional: ropeTraditional, ropeScale: ropeScale,
-            mropeSection: mropeSection)
+            mropeSection: mropeSection, mropeInterleaved: mropeInterleaved)
     }
 
     /// Build a quantized streaming cache from an existing plaintext ``StreamingKVCache``,
@@ -1646,7 +1704,8 @@ public final class QuantizedStreamingKVCache: StreamingKVCache, QuantizedKVCache
             keep: plain.keep, windowSize: plain.windowSize,
             ropeDimensions: plain.ropeDimensions, ropeBase: plain.ropeBase,
             ropeTraditional: plain.ropeTraditional, ropeScale: plain.ropeScale,
-            mropeSection: plain.mropeSection, bits: bits, groupSize: groupSize, mode: mode)
+            mropeSection: plain.mropeSection, mropeInterleaved: plain.mropeInterleaved,
+            bits: bits, groupSize: groupSize, mode: mode)
         self.step = plain.step
         // Migrate the plaintext window mask so M-RoPE eviction still works.
         self.adoptImageMask(from: plain)
@@ -1732,7 +1791,7 @@ public final class QuantizedStreamingKVCache: StreamingKVCache, QuantizedKVCache
             let refCache = StreamingKVCache(
                 keep: keep, windowSize: windowSize, ropeDimensions: ropeDimensions,
                 ropeBase: ropeBase, ropeTraditional: ropeTraditional, ropeScale: ropeScale,
-                mropeSection: mropeSection)
+                mropeSection: mropeSection, mropeInterleaved: mropeInterleaved)
             refCache.adoptImageMaskForSelfCheck(from: self)
             refCache.state = [baseK, baseV]
             refCache.evict(tokenCount: tokenCount)
@@ -1803,7 +1862,8 @@ public final class QuantizedStreamingKVCache: StreamingKVCache, QuantizedKVCache
         let new = QuantizedStreamingKVCache(
             keep: keep, windowSize: windowSize, ropeDimensions: ropeDimensions,
             ropeBase: ropeBase, ropeTraditional: ropeTraditional, ropeScale: ropeScale,
-            mropeSection: mropeSection, bits: bits, groupSize: groupSize, mode: mode)
+            mropeSection: mropeSection, mropeInterleaved: mropeInterleaved,
+            bits: bits, groupSize: groupSize, mode: mode)
         new.step = self.step
         new.adoptImageMask(from: self)
         let s = self.state

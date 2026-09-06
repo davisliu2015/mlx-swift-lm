@@ -1167,7 +1167,11 @@ enum Qwen35Language {
                         ropeBase: textConfig.ropeTheta,
                         ropeTraditional: false,
                         ropeScale: 1.0,
-                        mropeSection: mrope
+                        mropeSection: mrope,
+                        // RotaryEmbedding.applyInterleavedMRope 无条件按交错布局分配
+                        // 频率通道，必须传 true，否则裁切(evict)时对图片 token 的分段
+                        // 位移会套错通道。
+                        mropeInterleaved: true
                     )
                 }
                 return KVCacheSimple()

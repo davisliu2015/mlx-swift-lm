@@ -1602,7 +1602,11 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider, VLMPrefi
                     ropeBase: Float(vc.ropeTheta),
                     ropeTraditional: false,
                     ropeScale: 1.0,
-                    mropeSection: mrope
+                    mropeSection: mrope,
+                    // Qwen3VLLanguage.RotaryEmbedding.applyInterleavedMRope 无条件按
+                    // 交错布局分配频率通道（不看 config 的 mrope_interleaved 字段），
+                    // 必须传 true，否则裁切(evict)时对图片 token 的分段位移会套错通道。
+                    mropeInterleaved: true
                 )
             }
         }
